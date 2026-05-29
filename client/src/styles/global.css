@@ -239,6 +239,29 @@ h2 {
   gap: 0.75rem;
 }
 
+.transfer-panel {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.transfer-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.5rem;
+}
+
+.transfer-note {
+  font-size: 0.9rem;
+}
+
+.incoming-card {
+  border: 3px solid var(--line);
+  padding: 0.6rem;
+  background: #fff;
+  display: grid;
+  gap: 0.35rem;
+}
+
 .chat-row {
   display: grid;
   grid-template-columns: 1fr auto;
@@ -291,5 +314,9 @@ h2 {
 
   .meta {
     flex-direction: column;
+  }
+
+  .transfer-row {
+    grid-template-columns: 1fr;
   }
 }

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { RoomStatePayload, SignalPayload } from '@peerpair/shared';
+import type { FileCompletePeerMessage, FileMetaPeerMessage, PeerMessage, RoomStatePayload, SignalPayload } from '@peerpair/shared';
 import { socketClient } from './lib/socket/socketClient';
 import { socketEvents } from './lib/socket/socketEvents';
 import { createDataChannel } from './lib/webrtc/dataChannel';
@@ -10,6 +10,17 @@ type Toast = {
   id: number;
   message: string;
 };
+
+type IncomingFileState = {
+  transferId: string;
+  fileName: string;
+  fileSize: number;
+  mimeType: string;
+  receivedBytes: number;
+  downloadUrl: string | null;
+};
+
+const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;
 
 export function App() {
   const [socketId, setSocketId] = useState<string | null>(socketClient.id ?? null);
@@ -24,9 +35,36 @@ export function App() {
   const [chatMessage, setChatMessage] = useState<string>('');
   const [chatLog, setChatLog] = useState<string[]>([]);
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [transferStatus, setTransferStatus] = useState<string>('Idle');
+  const [incomingFile, setIncomingFile] = useState<IncomingFileState | null>(null);
 
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
+  const incomingChunksRef = useRef<ArrayBuffer[]>([]);
+  const incomingTransferIdRef = useRef<string | null>(null);
+
+  function safeParsePeerMessage(raw: string): PeerMessage | null {
+    try {
+      const parsed = JSON.parse(raw) as PeerMessage;
+      if (!parsed || typeof parsed !== 'object' || !('type' in parsed)) {
+        return null;
+      }
+
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  function sendControlMessage(message: PeerMessage) {
+    const channel = dataChannelRef.current;
+    if (!channel || channel.readyState !== 'open') {
+      throw new Error('DataChannel is not open');
+    }
+
+    channel.send(JSON.stringify(message));
+  }
 
   function addChatLog(message: string) {
     setChatLog((current) => [...current, message]);
@@ -64,6 +102,15 @@ export function App() {
 
     setRtcState('closed');
     setChannelState('closed');
+    incomingChunksRef.current = [];
+    incomingTransferIdRef.current = null;
+    setIncomingFile((current) => {
+      if (current?.downloadUrl) {
+        URL.revokeObjectURL(current.downloadUrl);
+      }
+
+      return null;
+    });
   }
 
   function attachDataChannel(channel: RTCDataChannel) {
@@ -81,7 +128,109 @@ export function App() {
     };
 
     channel.onmessage = (event) => {
-      addChatLog(`[peer] ${event.data}`);
+      if (typeof event.data === 'string') {
+        const message = safeParsePeerMessage(event.data);
+        if (!message) {
+          addChatLog(`[peer] ${event.data}`);
+          return;
+        }
+
+        if (message.type === 'text') {
+          addChatLog(`[peer] ${message.payload.message}`);
+          return;
+        }
+
+        if (message.type === 'file-meta') {
+          const payload = (message as FileMetaPeerMessage).payload;
+          incomingTransferIdRef.current = message.transferId;
+          incomingChunksRef.current = [];
+          setIncomingFile((current) => {
+            if (current?.downloadUrl) {
+              URL.revokeObjectURL(current.downloadUrl);
+            }
+
+            return {
+              transferId: message.transferId,
+              fileName: payload.fileName,
+              fileSize: payload.fileSize,
+              mimeType: payload.mimeType,
+              receivedBytes: 0,
+              downloadUrl: null,
+            };
+          });
+          setTransferStatus(`Receiving ${payload.fileName}`);
+          return;
+        }
+
+        if (message.type === 'file-complete') {
+          const payload = (message as FileCompletePeerMessage).payload;
+          if (!incomingTransferIdRef.current || incomingTransferIdRef.current !== message.transferId) {
+            pushErrorToast('Transfer complete received without matching metadata');
+            return;
+          }
+
+          const blob = new Blob(incomingChunksRef.current, {
+            type: incomingFile?.mimeType ?? 'application/octet-stream',
+          });
+
+          if (blob.size !== payload.totalBytes) {
+            pushErrorToast('Received file size does not match metadata');
+            setTransferStatus('Receive failed: size mismatch');
+            return;
+          }
+
+          const downloadUrl = URL.createObjectURL(blob);
+          setIncomingFile((current) => {
+            if (!current) {
+              return current;
+            }
+
+            if (current.downloadUrl) {
+              URL.revokeObjectURL(current.downloadUrl);
+            }
+
+            return {
+              ...current,
+              receivedBytes: blob.size,
+              downloadUrl,
+            };
+          });
+          setTransferStatus('File received');
+        }
+
+        return;
+      }
+
+      if (event.data instanceof ArrayBuffer) {
+        incomingChunksRef.current.push(event.data);
+        setIncomingFile((current) => {
+          if (!current) {
+            return current;
+          }
+
+          return {
+            ...current,
+            receivedBytes: current.receivedBytes + event.data.byteLength,
+          };
+        });
+        return;
+      }
+
+      if (event.data instanceof Blob) {
+        void event.data.arrayBuffer().then((buffer) => {
+          incomingChunksRef.current.push(buffer);
+          setIncomingFile((current) => {
+            if (!current) {
+              return current;
+            }
+
+            return {
+              ...current,
+              receivedBytes: current.receivedBytes + buffer.byteLength,
+            };
+          });
+        });
+      }
     };
   }
 
@@ -301,9 +450,66 @@ export function App() {
       return;
     }
 
-    channel.send(message);
+    const textMessage: PeerMessage = {
+      type: 'text',
+      transferId: crypto.randomUUID(),
+      payload: { message },
+    };
+
+    channel.send(JSON.stringify(textMessage));
     addChatLog(`[me] ${message}`);
     setChatMessage('');
+  }
+
+  async function handleSendFile() {
+    if (!selectedFile) {
+      pushErrorToast('Pick a file before sending');
+      return;
+    }
+
+    if (selectedFile.size > MAX_FILE_SIZE_BYTES) {
+      pushErrorToast('File is larger than 10 MB limit');
+      setTransferStatus('Send failed: file too large');
+      return;
+    }
+
+    const channel = dataChannelRef.current;
+    if (!channel || channel.readyState !== 'open') {
+      pushErrorToast('DataChannel is not open yet');
+      setTransferStatus('Send failed: channel closed');
+      return;
+    }
+
+    try {
+      const transferId = crypto.randomUUID();
+      setTransferStatus(`Sending ${selectedFile.name}`);
+
+      sendControlMessage({
+        type: 'file-meta',
+        transferId,
+        payload: {
+          fileName: selectedFile.name,
+          fileSize: selectedFile.size,
+          mimeType: selectedFile.type || 'application/octet-stream',
+        },
+      });
+
+      const fileBuffer = await selectedFile.arrayBuffer();
+      channel.send(fileBuffer);
+
+      sendControlMessage({
+        type: 'file-complete',
+        transferId,
+        payload: {
+          totalBytes: fileBuffer.byteLength,
+        },
+      });
+
+      setTransferStatus(`Sent ${selectedFile.name}`);
+    } catch {
+      pushErrorToast('Failed to send file');
+      setTransferStatus('Send failed');
+    }
   }
 
   useEffect(() => {
@@ -412,6 +618,40 @@ export function App() {
             <p className="log-line" key={`${entry}-${index}`}>{entry}</p>
           ))}
         </div>
+      </section>
+
+      <section className="panel transfer-panel">
+        <h2>Small File Transfer (Phase 4)</h2>
+        <div className="transfer-row">
+          <input
+            className="field"
+            type="file"
+            onChange={(event) => {
+              setSelectedFile(event.target.files?.[0] ?? null);
+            }}
+          />
+          <button className="btn primary" onClick={() => void handleSendFile()}>Send File</button>
+        </div>
+        <p className="transfer-note">Limit: 10 MB per file</p>
+        <p className="transfer-note">Transfer status: {transferStatus}</p>
+        {selectedFile ? (
+          <p className="transfer-note">
+            Selected: {selectedFile.name} ({Math.ceil(selectedFile.size / 1024)} KB)
+          </p>
+        ) : null}
+        {incomingFile ? (
+          <div className="incoming-card">
+            <p>Incoming: {incomingFile.fileName}</p>
+            <p>
+              Received: {incomingFile.receivedBytes} / {incomingFile.fileSize} bytes
+            </p>
+            {incomingFile.downloadUrl ? (
+              <a className="btn" href={incomingFile.downloadUrl} download={incomingFile.fileName}>
+                Download Received File
+              </a>
+            ) : null}
+          </div>
+        ) : null}
       </section>
 
       <footer className="meta">
