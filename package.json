@@ -1,0 +1,17 @@
+{
+  "name": "peerpair",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "npm@10",
+  "workspaces": [
+    "client",
+    "server",
+    "shared"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w server & npm run dev -w client",
+    "build": "npm run build -w shared && npm run build -w server && npm run build -w client",
+    "lint": "npm run lint -w client && npm run lint -w server && npm run lint -w shared",
+    "typecheck": "npm run typecheck -w client && npm run typecheck -w server && npm run typecheck -w shared"
+  }
+}
