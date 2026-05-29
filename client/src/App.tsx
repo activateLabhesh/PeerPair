@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { FileCompletePeerMessage, FileMetaPeerMessage, PeerMessage, RoomStatePayload, SignalPayload } from '@peerpair/shared';
+import type { FileCompletePeerMessage, FileStartPeerMessage, PeerMessage, RoomStatePayload, SignalPayload } from '@peerpair/shared';
 import { socketClient } from './lib/socket/socketClient';
 import { socketEvents } from './lib/socket/socketEvents';
 import { createDataChannel } from './lib/webrtc/dataChannel';
@@ -17,10 +17,27 @@ type IncomingFileState = {
   fileSize: number;
   mimeType: string;
   receivedBytes: number;
+  receivedChunks: number;
+  totalChunks: number;
   downloadUrl: string | null;
 };
 
-const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;
+type IncomingTransferBuffer = {
+  transferId: string;
+  fileName: string;
+  fileSize: number;
+  mimeType: string;
+  totalChunks: number;
+  chunks: Array<ArrayBuffer | null>;
+  receivedBytes: number;
+  receivedChunks: number;
+  highestContiguousChunk: number;
+};
+
+const CHUNK_SIZE_BYTES = 64 * 1024;
+const BUFFER_HIGH_WATERMARK_BYTES = 1 * 1024 * 1024;
+const BUFFER_LOW_WATERMARK_BYTES = 256 * 1024;
+const ACK_EVERY_CHUNKS = 8;
 
 export function App() {
   const [socketId, setSocketId] = useState<string | null>(socketClient.id ?? null);
@@ -41,8 +58,12 @@ export function App() {
 
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
-  const incomingChunksRef = useRef<ArrayBuffer[]>([]);
-  const incomingTransferIdRef = useRef<string | null>(null);
+  const incomingTransfersRef = useRef<Map<string, IncomingTransferBuffer>>(new Map());
+  const pendingIncomingChunkRef = useRef<{
+    transferId: string;
+    chunkIndex: number;
+    chunkByteLength: number;
+  } | null>(null);
 
   function safeParsePeerMessage(raw: string): PeerMessage | null {
     try {
@@ -64,6 +85,38 @@ export function App() {
     }
 
     channel.send(JSON.stringify(message));
+  }
+
+  function waitForBufferToDrain(channel: RTCDataChannel): Promise<void> {
+    if (channel.bufferedAmount <= BUFFER_HIGH_WATERMARK_BYTES) {
+      return Promise.resolve();
+    }
+
+    return new Promise((resolve) => {
+      const onLow = () => {
+        channel.removeEventListener('bufferedamountlow', onLow);
+        resolve();
+      };
+
+      channel.addEventListener('bufferedamountlow', onLow);
+
+      window.setTimeout(() => {
+        channel.removeEventListener('bufferedamountlow', onLow);
+        resolve();
+      }, 1500);
+    });
+  }
+
+  function clearIncomingTransfers() {
+    incomingTransfersRef.current.clear();
+    pendingIncomingChunkRef.current = null;
+    setIncomingFile((current) => {
+      if (current?.downloadUrl) {
+        URL.revokeObjectURL(current.downloadUrl);
+      }
+
+      return null;
+    });
   }
 
   function addChatLog(message: string) {
@@ -102,19 +155,12 @@ export function App() {
 
     setRtcState('closed');
     setChannelState('closed');
-    incomingChunksRef.current = [];
-    incomingTransferIdRef.current = null;
-    setIncomingFile((current) => {
-      if (current?.downloadUrl) {
-        URL.revokeObjectURL(current.downloadUrl);
-      }
-
-      return null;
-    });
+    clearIncomingTransfers();
   }
 
   function attachDataChannel(channel: RTCDataChannel) {
     dataChannelRef.current = channel;
+    channel.bufferedAmountLowThreshold = BUFFER_LOW_WATERMARK_BYTES;
     setChannelState(channel.readyState);
 
     channel.onopen = () => {
@@ -140,21 +186,35 @@ export function App() {
           return;
         }
 
-        if (message.type === 'file-meta') {
-          const payload = (message as FileMetaPeerMessage).payload;
-          incomingTransferIdRef.current = message.transferId;
-          incomingChunksRef.current = [];
+        if (message.type === 'file-start') {
+          const payload = (message as FileStartPeerMessage).payload;
+          const incomingTransfer: IncomingTransferBuffer = {
+            transferId: payload.transferId,
+            fileName: payload.fileName,
+            fileSize: payload.fileSize,
+            mimeType: payload.mimeType,
+            totalChunks: payload.totalChunks,
+            chunks: new Array<ArrayBuffer | null>(payload.totalChunks).fill(null),
+            receivedBytes: 0,
+            receivedChunks: 0,
+            highestContiguousChunk: -1,
+          };
+
+          incomingTransfersRef.current.set(payload.transferId, incomingTransfer);
+
           setIncomingFile((current) => {
             if (current?.downloadUrl) {
               URL.revokeObjectURL(current.downloadUrl);
             }
 
             return {
-              transferId: message.transferId,
+              transferId: payload.transferId,
               fileName: payload.fileName,
               fileSize: payload.fileSize,
               mimeType: payload.mimeType,
               receivedBytes: 0,
+              receivedChunks: 0,
+              totalChunks: payload.totalChunks,
               downloadUrl: null,
             };
           });
@@ -162,19 +222,53 @@ export function App() {
           return;
         }
 
+        if (message.type === 'file-chunk') {
+          pendingIncomingChunkRef.current = {
+            transferId: message.payload.transferId,
+            chunkIndex: message.payload.chunkIndex,
+            chunkByteLength: message.payload.chunkByteLength,
+          };
+          return;
+        }
+
+        if (message.type === 'file-ack') {
+          const ackedChunks = message.payload.receivedUpToChunkIndex + 1;
+          setTransferStatus(`Peer ACK: ${ackedChunks} chunks (${message.payload.receivedBytes} bytes)`);
+          return;
+        }
+
+        if (message.type === 'file-error') {
+          setTransferStatus(`Transfer failed: ${message.payload.message}`);
+          pushErrorToast(`Peer transfer error: ${message.payload.message}`);
+          return;
+        }
+
+        if (message.type === 'file-cancel') {
+          setTransferStatus(`Transfer canceled: ${message.payload.reason ?? 'peer canceled'}`);
+          pushErrorToast(`Peer canceled transfer${message.payload.reason ? `: ${message.payload.reason}` : ''}`);
+          clearIncomingTransfers();
+          return;
+        }
+
         if (message.type === 'file-complete') {
           const payload = (message as FileCompletePeerMessage).payload;
-          if (!incomingTransferIdRef.current || incomingTransferIdRef.current !== message.transferId) {
-            pushErrorToast('Transfer complete received without matching metadata');
+          const transfer = incomingTransfersRef.current.get(payload.transferId);
+          if (!transfer) {
+            pushErrorToast('Transfer complete received without matching file-start');
             return;
           }
 
-          const blob = new Blob(incomingChunksRef.current, {
-            type: incomingFile?.mimeType ?? 'application/octet-stream',
-          });
+          if (transfer.receivedBytes !== payload.totalBytes || transfer.receivedChunks !== payload.totalChunks) {
+            pushErrorToast('Received file size/chunk count does not match completion message');
+            setTransferStatus('Receive failed: transfer mismatch');
+            return;
+          }
+
+          const finalizedChunks = transfer.chunks.filter((chunk): chunk is ArrayBuffer => chunk !== null);
+          const blob = new Blob(finalizedChunks, { type: transfer.mimeType || 'application/octet-stream' });
 
           if (blob.size !== payload.totalBytes) {
-            pushErrorToast('Received file size does not match metadata');
+            pushErrorToast('Received file size does not match completion payload');
             setTransferStatus('Receive failed: size mismatch');
             return;
           }
@@ -192,44 +286,87 @@ export function App() {
             return {
               ...current,
               receivedBytes: blob.size,
+              receivedChunks: transfer.totalChunks,
               downloadUrl,
             };
           });
           setTransferStatus('File received');
+          incomingTransfersRef.current.delete(payload.transferId);
+          pendingIncomingChunkRef.current = null;
         }
 
         return;
       }
 
-      if (event.data instanceof ArrayBuffer) {
-        incomingChunksRef.current.push(event.data);
+      const processBinaryChunk = (buffer: ArrayBuffer) => {
+        const pendingHeader = pendingIncomingChunkRef.current;
+        if (!pendingHeader) {
+          pushErrorToast('Binary chunk received without file-chunk header');
+          return;
+        }
+
+        const transfer = incomingTransfersRef.current.get(pendingHeader.transferId);
+        if (!transfer) {
+          pushErrorToast('Binary chunk received for unknown transfer');
+          pendingIncomingChunkRef.current = null;
+          return;
+        }
+
+        if (pendingHeader.chunkIndex < 0 || pendingHeader.chunkIndex >= transfer.totalChunks) {
+          pushErrorToast('Invalid chunk index received');
+          pendingIncomingChunkRef.current = null;
+          return;
+        }
+
+        if (transfer.chunks[pendingHeader.chunkIndex] === null) {
+          transfer.chunks[pendingHeader.chunkIndex] = buffer;
+          transfer.receivedBytes += buffer.byteLength;
+          transfer.receivedChunks += 1;
+
+          while (
+            transfer.highestContiguousChunk + 1 < transfer.totalChunks &&
+            transfer.chunks[transfer.highestContiguousChunk + 1] !== null
+          ) {
+            transfer.highestContiguousChunk += 1;
+          }
+        }
+
         setIncomingFile((current) => {
-          if (!current) {
+          if (!current || current.transferId !== transfer.transferId) {
             return current;
           }
 
           return {
             ...current,
-            receivedBytes: current.receivedBytes + event.data.byteLength,
+            receivedBytes: transfer.receivedBytes,
+            receivedChunks: transfer.receivedChunks,
           };
         });
+
+        if (
+          transfer.receivedChunks % ACK_EVERY_CHUNKS === 0 ||
+          transfer.receivedChunks === transfer.totalChunks
+        ) {
+          sendControlMessage({
+            type: 'file-ack',
+            payload: {
+              transferId: transfer.transferId,
+              receivedUpToChunkIndex: transfer.highestContiguousChunk,
+              receivedBytes: transfer.receivedBytes,
+            },
+          });
+        }
+
+        pendingIncomingChunkRef.current = null;
+      };
+
+      if (event.data instanceof ArrayBuffer) {
+        processBinaryChunk(event.data);
         return;
       }
 
       if (event.data instanceof Blob) {
-        void event.data.arrayBuffer().then((buffer) => {
-          incomingChunksRef.current.push(buffer);
-          setIncomingFile((current) => {
-            if (!current) {
-              return current;
-            }
-
-            return {
-              ...current,
-              receivedBytes: current.receivedBytes + buffer.byteLength,
-            };
-          });
-        });
+        void event.data.arrayBuffer().then(processBinaryChunk);
       }
     };
   }
@@ -452,7 +589,6 @@ export function App() {
 
     const textMessage: PeerMessage = {
       type: 'text',
-      transferId: crypto.randomUUID(),
       payload: { message },
     };
 
@@ -467,12 +603,6 @@ export function App() {
       return;
     }
 
-    if (selectedFile.size > MAX_FILE_SIZE_BYTES) {
-      pushErrorToast('File is larger than 10 MB limit');
-      setTransferStatus('Send failed: file too large');
-      return;
-    }
-
     const channel = dataChannelRef.current;
     if (!channel || channel.readyState !== 'open') {
       pushErrorToast('DataChannel is not open yet');
@@ -482,26 +612,52 @@ export function App() {
 
     try {
       const transferId = crypto.randomUUID();
-      setTransferStatus(`Sending ${selectedFile.name}`);
+      const totalChunks = Math.ceil(selectedFile.size / CHUNK_SIZE_BYTES);
+      setTransferStatus(`Starting transfer for ${selectedFile.name}`);
 
       sendControlMessage({
-        type: 'file-meta',
-        transferId,
+        type: 'file-start',
         payload: {
+          transferId,
           fileName: selectedFile.name,
           fileSize: selectedFile.size,
           mimeType: selectedFile.type || 'application/octet-stream',
+          chunkSize: CHUNK_SIZE_BYTES,
+          totalChunks,
         },
       });
 
-      const fileBuffer = await selectedFile.arrayBuffer();
-      channel.send(fileBuffer);
+      for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+        await waitForBufferToDrain(channel);
+
+        const start = chunkIndex * CHUNK_SIZE_BYTES;
+        const end = Math.min(start + CHUNK_SIZE_BYTES, selectedFile.size);
+        const chunkBuffer = await selectedFile.slice(start, end).arrayBuffer();
+
+        sendControlMessage({
+          type: 'file-chunk',
+          payload: {
+            transferId,
+            chunkIndex,
+            totalChunks,
+            byteOffset: start,
+            chunkByteLength: chunkBuffer.byteLength,
+          },
+        });
+
+        channel.send(chunkBuffer);
+
+        setTransferStatus(
+          `Sending ${selectedFile.name}: ${chunkIndex + 1}/${totalChunks} chunks (${end}/${selectedFile.size} bytes)`
+        );
+      }
 
       sendControlMessage({
         type: 'file-complete',
-        transferId,
         payload: {
-          totalBytes: fileBuffer.byteLength,
+          transferId,
+          totalBytes: selectedFile.size,
+          totalChunks,
         },
       });
 
@@ -621,7 +777,7 @@ export function App() {
       </section>
 
       <section className="panel transfer-panel">
-        <h2>Small File Transfer (Phase 4)</h2>
+        <h2>Chunked File Transfer (Phase 5)</h2>
         <div className="transfer-row">
           <input
             className="field"
@@ -632,7 +788,7 @@ export function App() {
           />
           <button className="btn primary" onClick={() => void handleSendFile()}>Send File</button>
         </div>
-        <p className="transfer-note">Limit: 10 MB per file</p>
+        <p className="transfer-note">Chunk size: {Math.round(CHUNK_SIZE_BYTES / 1024)} KB</p>
         <p className="transfer-note">Transfer status: {transferStatus}</p>
         {selectedFile ? (
           <p className="transfer-note">
@@ -644,6 +800,9 @@ export function App() {
             <p>Incoming: {incomingFile.fileName}</p>
             <p>
               Received: {incomingFile.receivedBytes} / {incomingFile.fileSize} bytes
+            </p>
+            <p>
+              Chunks: {incomingFile.receivedChunks} / {incomingFile.totalChunks}
             </p>
             {incomingFile.downloadUrl ? (
               <a className="btn" href={incomingFile.downloadUrl} download={incomingFile.fileName}>

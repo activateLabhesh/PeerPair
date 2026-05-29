@@ -5,7 +5,10 @@ import { socketEvents } from './lib/socket/socketEvents';
 import { createDataChannel } from './lib/webrtc/dataChannel';
 import { createPeerConnection } from './lib/webrtc/peerConnection';
 import './styles/global.css';
-const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;
+const CHUNK_SIZE_BYTES = 64 * 1024;
+const BUFFER_HIGH_WATERMARK_BYTES = 1 * 1024 * 1024;
+const BUFFER_LOW_WATERMARK_BYTES = 256 * 1024;
+const ACK_EVERY_CHUNKS = 8;
 export function App() {
     const [socketId, setSocketId] = useState(socketClient.id ?? null);
     const [isConnected, setIsConnected] = useState(socketClient.connected);
@@ -24,8 +27,8 @@ export function App() {
     const [incomingFile, setIncomingFile] = useState(null);
     const peerConnectionRef = useRef(null);
     const dataChannelRef = useRef(null);
-    const incomingChunksRef = useRef([]);
-    const incomingTransferIdRef = useRef(null);
+    const incomingTransfersRef = useRef(new Map());
+    const pendingIncomingChunkRef = useRef(null);
     function safeParsePeerMessage(raw) {
         try {
             const parsed = JSON.parse(raw);
@@ -44,6 +47,32 @@ export function App() {
             throw new Error('DataChannel is not open');
         }
         channel.send(JSON.stringify(message));
+    }
+    function waitForBufferToDrain(channel) {
+        if (channel.bufferedAmount <= BUFFER_HIGH_WATERMARK_BYTES) {
+            return Promise.resolve();
+        }
+        return new Promise((resolve) => {
+            const onLow = () => {
+                channel.removeEventListener('bufferedamountlow', onLow);
+                resolve();
+            };
+            channel.addEventListener('bufferedamountlow', onLow);
+            window.setTimeout(() => {
+                channel.removeEventListener('bufferedamountlow', onLow);
+                resolve();
+            }, 1500);
+        });
+    }
+    function clearIncomingTransfers() {
+        incomingTransfersRef.current.clear();
+        pendingIncomingChunkRef.current = null;
+        setIncomingFile((current) => {
+            if (current?.downloadUrl) {
+                URL.revokeObjectURL(current.downloadUrl);
+            }
+            return null;
+        });
     }
     function addChatLog(message) {
         setChatLog((current) => [...current, message]);
@@ -75,17 +104,11 @@ export function App() {
         }
         setRtcState('closed');
         setChannelState('closed');
-        incomingChunksRef.current = [];
-        incomingTransferIdRef.current = null;
-        setIncomingFile((current) => {
-            if (current?.downloadUrl) {
-                URL.revokeObjectURL(current.downloadUrl);
-            }
-            return null;
-        });
+        clearIncomingTransfers();
     }
     function attachDataChannel(channel) {
         dataChannelRef.current = channel;
+        channel.bufferedAmountLowThreshold = BUFFER_LOW_WATERMARK_BYTES;
         setChannelState(channel.readyState);
         channel.onopen = () => {
             setChannelState(channel.readyState);
@@ -106,37 +129,78 @@ export function App() {
                     addChatLog(`[peer] ${message.payload.message}`);
                     return;
                 }
-                if (message.type === 'file-meta') {
+                if (message.type === 'file-start') {
                     const payload = message.payload;
-                    incomingTransferIdRef.current = message.transferId;
-                    incomingChunksRef.current = [];
+                    const incomingTransfer = {
+                        transferId: payload.transferId,
+                        fileName: payload.fileName,
+                        fileSize: payload.fileSize,
+                        mimeType: payload.mimeType,
+                        totalChunks: payload.totalChunks,
+                        chunks: new Array(payload.totalChunks).fill(null),
+                        receivedBytes: 0,
+                        receivedChunks: 0,
+                        highestContiguousChunk: -1,
+                    };
+                    incomingTransfersRef.current.set(payload.transferId, incomingTransfer);
                     setIncomingFile((current) => {
                         if (current?.downloadUrl) {
                             URL.revokeObjectURL(current.downloadUrl);
                         }
                         return {
-                            transferId: message.transferId,
+                            transferId: payload.transferId,
                             fileName: payload.fileName,
                             fileSize: payload.fileSize,
                             mimeType: payload.mimeType,
                             receivedBytes: 0,
+                            receivedChunks: 0,
+                            totalChunks: payload.totalChunks,
                             downloadUrl: null,
                         };
                     });
                     setTransferStatus(`Receiving ${payload.fileName}`);
                     return;
                 }
+                if (message.type === 'file-chunk') {
+                    pendingIncomingChunkRef.current = {
+                        transferId: message.payload.transferId,
+                        chunkIndex: message.payload.chunkIndex,
+                        chunkByteLength: message.payload.chunkByteLength,
+                    };
+                    return;
+                }
+                if (message.type === 'file-ack') {
+                    const ackedChunks = message.payload.receivedUpToChunkIndex + 1;
+                    setTransferStatus(`Peer ACK: ${ackedChunks} chunks (${message.payload.receivedBytes} bytes)`);
+                    return;
+                }
+                if (message.type === 'file-error') {
+                    setTransferStatus(`Transfer failed: ${message.payload.message}`);
+                    pushErrorToast(`Peer transfer error: ${message.payload.message}`);
+                    return;
+                }
+                if (message.type === 'file-cancel') {
+                    setTransferStatus(`Transfer canceled: ${message.payload.reason ?? 'peer canceled'}`);
+                    pushErrorToast(`Peer canceled transfer${message.payload.reason ? `: ${message.payload.reason}` : ''}`);
+                    clearIncomingTransfers();
+                    return;
+                }
                 if (message.type === 'file-complete') {
                     const payload = message.payload;
-                    if (!incomingTransferIdRef.current || incomingTransferIdRef.current !== message.transferId) {
-                        pushErrorToast('Transfer complete received without matching metadata');
+                    const transfer = incomingTransfersRef.current.get(payload.transferId);
+                    if (!transfer) {
+                        pushErrorToast('Transfer complete received without matching file-start');
                         return;
                     }
-                    const blob = new Blob(incomingChunksRef.current, {
-                        type: incomingFile?.mimeType ?? 'application/octet-stream',
-                    });
+                    if (transfer.receivedBytes !== payload.totalBytes || transfer.receivedChunks !== payload.totalChunks) {
+                        pushErrorToast('Received file size/chunk count does not match completion message');
+                        setTransferStatus('Receive failed: transfer mismatch');
+                        return;
+                    }
+                    const finalizedChunks = transfer.chunks.filter((chunk) => chunk !== null);
+                    const blob = new Blob(finalizedChunks, { type: transfer.mimeType || 'application/octet-stream' });
                     if (blob.size !== payload.totalBytes) {
-                        pushErrorToast('Received file size does not match metadata');
+                        pushErrorToast('Received file size does not match completion payload');
                         setTransferStatus('Receive failed: size mismatch');
                         return;
                     }
@@ -151,39 +215,71 @@ export function App() {
                         return {
                             ...current,
                             receivedBytes: blob.size,
+                            receivedChunks: transfer.totalChunks,
                             downloadUrl,
                         };
                     });
                     setTransferStatus('File received');
+                    incomingTransfersRef.current.delete(payload.transferId);
+                    pendingIncomingChunkRef.current = null;
                 }
                 return;
             }
-            if (event.data instanceof ArrayBuffer) {
-                incomingChunksRef.current.push(event.data);
+            const processBinaryChunk = (buffer) => {
+                const pendingHeader = pendingIncomingChunkRef.current;
+                if (!pendingHeader) {
+                    pushErrorToast('Binary chunk received without file-chunk header');
+                    return;
+                }
+                const transfer = incomingTransfersRef.current.get(pendingHeader.transferId);
+                if (!transfer) {
+                    pushErrorToast('Binary chunk received for unknown transfer');
+                    pendingIncomingChunkRef.current = null;
+                    return;
+                }
+                if (pendingHeader.chunkIndex < 0 || pendingHeader.chunkIndex >= transfer.totalChunks) {
+                    pushErrorToast('Invalid chunk index received');
+                    pendingIncomingChunkRef.current = null;
+                    return;
+                }
+                if (transfer.chunks[pendingHeader.chunkIndex] === null) {
+                    transfer.chunks[pendingHeader.chunkIndex] = buffer;
+                    transfer.receivedBytes += buffer.byteLength;
+                    transfer.receivedChunks += 1;
+                    while (transfer.highestContiguousChunk + 1 < transfer.totalChunks &&
+                        transfer.chunks[transfer.highestContiguousChunk + 1] !== null) {
+                        transfer.highestContiguousChunk += 1;
+                    }
+                }
                 setIncomingFile((current) => {
-                    if (!current) {
+                    if (!current || current.transferId !== transfer.transferId) {
                         return current;
                     }
                     return {
                         ...current,
-                        receivedBytes: current.receivedBytes + event.data.byteLength,
+                        receivedBytes: transfer.receivedBytes,
+                        receivedChunks: transfer.receivedChunks,
                     };
                 });
+                if (transfer.receivedChunks % ACK_EVERY_CHUNKS === 0 ||
+                    transfer.receivedChunks === transfer.totalChunks) {
+                    sendControlMessage({
+                        type: 'file-ack',
+                        payload: {
+                            transferId: transfer.transferId,
+                            receivedUpToChunkIndex: transfer.highestContiguousChunk,
+                            receivedBytes: transfer.receivedBytes,
+                        },
+                    });
+                }
+                pendingIncomingChunkRef.current = null;
+            };
+            if (event.data instanceof ArrayBuffer) {
+                processBinaryChunk(event.data);
                 return;
             }
             if (event.data instanceof Blob) {
-                void event.data.arrayBuffer().then((buffer) => {
-                    incomingChunksRef.current.push(buffer);
-                    setIncomingFile((current) => {
-                        if (!current) {
-                            return current;
-                        }
-                        return {
-                            ...current,
-                            receivedBytes: current.receivedBytes + buffer.byteLength,
-                        };
-                    });
-                });
+                void event.data.arrayBuffer().then(processBinaryChunk);
             }
         };
     }
@@ -370,7 +466,6 @@ export function App() {
         }
         const textMessage = {
             type: 'text',
-            transferId: crypto.randomUUID(),
             payload: { message },
         };
         channel.send(JSON.stringify(textMessage));
@@ -382,11 +477,6 @@ export function App() {
             pushErrorToast('Pick a file before sending');
             return;
         }
-        if (selectedFile.size > MAX_FILE_SIZE_BYTES) {
-            pushErrorToast('File is larger than 10 MB limit');
-            setTransferStatus('Send failed: file too large');
-            return;
-        }
         const channel = dataChannelRef.current;
         if (!channel || channel.readyState !== 'open') {
             pushErrorToast('DataChannel is not open yet');
@@ -395,23 +485,43 @@ export function App() {
         }
         try {
             const transferId = crypto.randomUUID();
-            setTransferStatus(`Sending ${selectedFile.name}`);
+            const totalChunks = Math.ceil(selectedFile.size / CHUNK_SIZE_BYTES);
+            setTransferStatus(`Starting transfer for ${selectedFile.name}`);
             sendControlMessage({
-                type: 'file-meta',
-                transferId,
+                type: 'file-start',
                 payload: {
+                    transferId,
                     fileName: selectedFile.name,
                     fileSize: selectedFile.size,
                     mimeType: selectedFile.type || 'application/octet-stream',
+                    chunkSize: CHUNK_SIZE_BYTES,
+                    totalChunks,
                 },
             });
-            const fileBuffer = await selectedFile.arrayBuffer();
-            channel.send(fileBuffer);
+            for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+                await waitForBufferToDrain(channel);
+                const start = chunkIndex * CHUNK_SIZE_BYTES;
+                const end = Math.min(start + CHUNK_SIZE_BYTES, selectedFile.size);
+                const chunkBuffer = await selectedFile.slice(start, end).arrayBuffer();
+                sendControlMessage({
+                    type: 'file-chunk',
+                    payload: {
+                        transferId,
+                        chunkIndex,
+                        totalChunks,
+                        byteOffset: start,
+                        chunkByteLength: chunkBuffer.byteLength,
+                    },
+                });
+                channel.send(chunkBuffer);
+                setTransferStatus(`Sending ${selectedFile.name}: ${chunkIndex + 1}/${totalChunks} chunks (${end}/${selectedFile.size} bytes)`);
+            }
             sendControlMessage({
                 type: 'file-complete',
-                transferId,
                 payload: {
-                    totalBytes: fileBuffer.byteLength,
+                    transferId,
+                    totalBytes: selectedFile.size,
+                    totalChunks,
                 },
             });
             setTransferStatus(`Sent ${selectedFile.name}`);
@@ -445,7 +555,7 @@ export function App() {
             socketClient.off(socketEvents.pong, onPong);
         };
     }, []);
-    return (_jsxs("main", { className: "app-shell", children: [_jsx("aside", { className: "toast-stack", "aria-live": "polite", children: toasts.map((toast) => (_jsxs("div", { className: "toast toast-error", children: [_jsx("span", { children: toast.message }), _jsx("button", { className: "toast-close", onClick: () => removeToast(toast.id), children: "x" })] }, toast.id))) }), _jsxs("section", { className: "hero-card", children: [_jsx("p", { className: "eyebrow", children: "PeerPair / Phase 2" }), _jsx("h1", { children: "Realtime Peer Signaling Playground" }), _jsx("p", { className: "hero-copy", children: "Create a room, join with a second browser, and watch signaling + DataChannel state update live." })] }), _jsxs("section", { className: "panel room-panel", children: [_jsx("h2", { children: "Room Control" }), _jsxs("div", { className: "room-actions", children: [_jsx("button", { className: "btn primary", onClick: handleCreateRoom, children: "Create Room" }), _jsx("button", { className: "btn", onClick: handleJoinRoom, children: "Join Room" }), _jsx("button", { className: "btn danger", onClick: handleLeaveRoom, children: "Leave Room" })] }), _jsx("input", { className: "field", type: "text", placeholder: "Enter room ID", value: roomId, onChange: (event) => setRoomId(event.target.value) }), _jsxs("div", { className: "badge-row", children: [_jsxs("span", { className: "badge", children: ["Active: ", joinedRoomId ?? 'None'] }), _jsxs("span", { className: "badge", children: ["Peers: ", peers.length] })] })] }), _jsxs("section", { className: "panel grid-panel", children: [_jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "Socket" }), _jsx("p", { className: `value ${isConnected ? 'ok' : 'bad'}`, children: isConnected ? 'Connected' : 'Disconnected' })] }), _jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "WebRTC" }), _jsx("p", { className: "value", children: rtcState })] }), _jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "DataChannel" }), _jsx("p", { className: "value", children: channelState })] }), _jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "Room Status" }), _jsx("p", { className: "value", children: statusMessage })] })] }), _jsxs("section", { className: "panel chat-panel", children: [_jsx("h2", { children: "DataChannel Chat" }), _jsxs("div", { className: "chat-row", children: [_jsx("input", { className: "field", type: "text", placeholder: "Send message over DataChannel", value: chatMessage, onChange: (event) => setChatMessage(event.target.value) }), _jsx("button", { className: "btn primary", onClick: handleSendMessage, children: "Send" })] }), _jsxs("div", { className: "log-box", children: [chatLog.length === 0 ? _jsx("p", { className: "log-empty", children: "No messages yet" }) : null, chatLog.map((entry, index) => (_jsx("p", { className: "log-line", children: entry }, `${entry}-${index}`)))] })] }), _jsxs("section", { className: "panel transfer-panel", children: [_jsx("h2", { children: "Small File Transfer (Phase 4)" }), _jsxs("div", { className: "transfer-row", children: [_jsx("input", { className: "field", type: "file", onChange: (event) => {
+    return (_jsxs("main", { className: "app-shell", children: [_jsx("aside", { className: "toast-stack", "aria-live": "polite", children: toasts.map((toast) => (_jsxs("div", { className: "toast toast-error", children: [_jsx("span", { children: toast.message }), _jsx("button", { className: "toast-close", onClick: () => removeToast(toast.id), children: "x" })] }, toast.id))) }), _jsxs("section", { className: "hero-card", children: [_jsx("p", { className: "eyebrow", children: "PeerPair / Phase 2" }), _jsx("h1", { children: "Realtime Peer Signaling Playground" }), _jsx("p", { className: "hero-copy", children: "Create a room, join with a second browser, and watch signaling + DataChannel state update live." })] }), _jsxs("section", { className: "panel room-panel", children: [_jsx("h2", { children: "Room Control" }), _jsxs("div", { className: "room-actions", children: [_jsx("button", { className: "btn primary", onClick: handleCreateRoom, children: "Create Room" }), _jsx("button", { className: "btn", onClick: handleJoinRoom, children: "Join Room" }), _jsx("button", { className: "btn danger", onClick: handleLeaveRoom, children: "Leave Room" })] }), _jsx("input", { className: "field", type: "text", placeholder: "Enter room ID", value: roomId, onChange: (event) => setRoomId(event.target.value) }), _jsxs("div", { className: "badge-row", children: [_jsxs("span", { className: "badge", children: ["Active: ", joinedRoomId ?? 'None'] }), _jsxs("span", { className: "badge", children: ["Peers: ", peers.length] })] })] }), _jsxs("section", { className: "panel grid-panel", children: [_jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "Socket" }), _jsx("p", { className: `value ${isConnected ? 'ok' : 'bad'}`, children: isConnected ? 'Connected' : 'Disconnected' })] }), _jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "WebRTC" }), _jsx("p", { className: "value", children: rtcState })] }), _jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "DataChannel" }), _jsx("p", { className: "value", children: channelState })] }), _jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "Room Status" }), _jsx("p", { className: "value", children: statusMessage })] })] }), _jsxs("section", { className: "panel chat-panel", children: [_jsx("h2", { children: "DataChannel Chat" }), _jsxs("div", { className: "chat-row", children: [_jsx("input", { className: "field", type: "text", placeholder: "Send message over DataChannel", value: chatMessage, onChange: (event) => setChatMessage(event.target.value) }), _jsx("button", { className: "btn primary", onClick: handleSendMessage, children: "Send" })] }), _jsxs("div", { className: "log-box", children: [chatLog.length === 0 ? _jsx("p", { className: "log-empty", children: "No messages yet" }) : null, chatLog.map((entry, index) => (_jsx("p", { className: "log-line", children: entry }, `${entry}-${index}`)))] })] }), _jsxs("section", { className: "panel transfer-panel", children: [_jsx("h2", { children: "Chunked File Transfer (Phase 5)" }), _jsxs("div", { className: "transfer-row", children: [_jsx("input", { className: "field", type: "file", onChange: (event) => {
                                     setSelectedFile(event.target.files?.[0] ?? null);
-                                } }), _jsx("button", { className: "btn primary", onClick: () => void handleSendFile(), children: "Send File" })] }), _jsx("p", { className: "transfer-note", children: "Limit: 10 MB per file" }), _jsxs("p", { className: "transfer-note", children: ["Transfer status: ", transferStatus] }), selectedFile ? (_jsxs("p", { className: "transfer-note", children: ["Selected: ", selectedFile.name, " (", Math.ceil(selectedFile.size / 1024), " KB)"] })) : null, incomingFile ? (_jsxs("div", { className: "incoming-card", children: [_jsxs("p", { children: ["Incoming: ", incomingFile.fileName] }), _jsxs("p", { children: ["Received: ", incomingFile.receivedBytes, " / ", incomingFile.fileSize, " bytes"] }), incomingFile.downloadUrl ? (_jsx("a", { className: "btn", href: incomingFile.downloadUrl, download: incomingFile.fileName, children: "Download Received File" })) : null] })) : null] }), _jsxs("footer", { className: "meta", children: [_jsxs("span", { children: ["Socket ID: ", socketId ?? 'N/A'] }), _jsxs("span", { children: ["Handshake: ", pongMessage] })] })] }));
+                                } }), _jsx("button", { className: "btn primary", onClick: () => void handleSendFile(), children: "Send File" })] }), _jsxs("p", { className: "transfer-note", children: ["Chunk size: ", Math.round(CHUNK_SIZE_BYTES / 1024), " KB"] }), _jsxs("p", { className: "transfer-note", children: ["Transfer status: ", transferStatus] }), selectedFile ? (_jsxs("p", { className: "transfer-note", children: ["Selected: ", selectedFile.name, " (", Math.ceil(selectedFile.size / 1024), " KB)"] })) : null, incomingFile ? (_jsxs("div", { className: "incoming-card", children: [_jsxs("p", { children: ["Incoming: ", incomingFile.fileName] }), _jsxs("p", { children: ["Received: ", incomingFile.receivedBytes, " / ", incomingFile.fileSize, " bytes"] }), _jsxs("p", { children: ["Chunks: ", incomingFile.receivedChunks, " / ", incomingFile.totalChunks] }), incomingFile.downloadUrl ? (_jsx("a", { className: "btn", href: incomingFile.downloadUrl, download: incomingFile.fileName, children: "Download Received File" })) : null] })) : null] }), _jsxs("footer", { className: "meta", children: [_jsxs("span", { children: ["Socket ID: ", socketId ?? 'N/A'] }), _jsxs("span", { children: ["Handshake: ", pongMessage] })] })] }));
 }
