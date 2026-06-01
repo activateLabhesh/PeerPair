@@ -32,12 +32,23 @@ type IncomingTransferBuffer = {
   receivedBytes: number;
   receivedChunks: number;
   highestContiguousChunk: number;
+  startedAt: number;
 };
 
-const CHUNK_SIZE_BYTES = 64 * 1024;
-const BUFFER_HIGH_WATERMARK_BYTES = 1 * 1024 * 1024;
-const BUFFER_LOW_WATERMARK_BYTES = 256 * 1024;
-const ACK_EVERY_CHUNKS = 8;
+type TransferMetrics = {
+  direction: 'send' | 'receive';
+  fileName: string;
+  totalBytes: number;
+  durationMs: number;
+  speedMbps: number;
+  peakBufferedAmount?: number;
+};
+
+const CHUNK_SIZE_BYTES = 128 * 1024;
+const BUFFER_HIGH_WATERMARK_BYTES = 4 * 1024 * 1024;
+const BUFFER_LOW_WATERMARK_BYTES = 1 * 1024 * 1024;
+const ACK_EVERY_CHUNKS = 32;
+const UI_UPDATE_INTERVAL_MS = 150;
 
 export function App() {
   const [socketId, setSocketId] = useState<string | null>(socketClient.id ?? null);
@@ -55,6 +66,7 @@ export function App() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [transferStatus, setTransferStatus] = useState<string>('Idle');
   const [incomingFile, setIncomingFile] = useState<IncomingFileState | null>(null);
+  const [transferMetrics, setTransferMetrics] = useState<TransferMetrics | null>(null);
 
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
@@ -64,6 +76,8 @@ export function App() {
     chunkIndex: number;
     chunkByteLength: number;
   } | null>(null);
+  const lastIncomingUiUpdateRef = useRef<number>(0);
+  const lastOutgoingUiUpdateRef = useRef<number>(0);
 
   function safeParsePeerMessage(raw: string): PeerMessage | null {
     try {
@@ -85,6 +99,15 @@ export function App() {
     }
 
     channel.send(JSON.stringify(message));
+  }
+
+  function toMbps(totalBytes: number, durationMs: number): number {
+    if (durationMs <= 0) {
+      return 0;
+    }
+
+    const bits = totalBytes * 8;
+    return bits / (durationMs / 1000) / 1_000_000;
   }
 
   function waitForBufferToDrain(channel: RTCDataChannel): Promise<void> {
@@ -188,6 +211,7 @@ export function App() {
 
         if (message.type === 'file-start') {
           const payload = (message as FileStartPeerMessage).payload;
+          setTransferMetrics(null);
           const incomingTransfer: IncomingTransferBuffer = {
             transferId: payload.transferId,
             fileName: payload.fileName,
@@ -198,6 +222,7 @@ export function App() {
             receivedBytes: 0,
             receivedChunks: 0,
             highestContiguousChunk: -1,
+            startedAt: performance.now(),
           };
 
           incomingTransfersRef.current.set(payload.transferId, incomingTransfer);
@@ -232,8 +257,12 @@ export function App() {
         }
 
         if (message.type === 'file-ack') {
-          const ackedChunks = message.payload.receivedUpToChunkIndex + 1;
-          setTransferStatus(`Peer ACK: ${ackedChunks} chunks (${message.payload.receivedBytes} bytes)`);
+          const now = performance.now();
+          if (now - lastOutgoingUiUpdateRef.current >= UI_UPDATE_INTERVAL_MS) {
+            const ackedChunks = message.payload.receivedUpToChunkIndex + 1;
+            setTransferStatus(`Peer ACK: ${ackedChunks} chunks (${message.payload.receivedBytes} bytes)`);
+            lastOutgoingUiUpdateRef.current = now;
+          }
           return;
         }
 
@@ -291,6 +320,14 @@ export function App() {
             };
           });
           setTransferStatus('File received');
+          const durationMs = performance.now() - transfer.startedAt;
+          setTransferMetrics({
+            direction: 'receive',
+            fileName: transfer.fileName,
+            totalBytes: blob.size,
+            durationMs,
+            speedMbps: toMbps(blob.size, durationMs),
+          });
           incomingTransfersRef.current.delete(payload.transferId);
           pendingIncomingChunkRef.current = null;
         }
@@ -318,6 +355,12 @@ export function App() {
           return;
         }
 
+        if (buffer.byteLength !== pendingHeader.chunkByteLength) {
+          pushErrorToast('Chunk size mismatch received');
+          pendingIncomingChunkRef.current = null;
+          return;
+        }
+
         if (transfer.chunks[pendingHeader.chunkIndex] === null) {
           transfer.chunks[pendingHeader.chunkIndex] = buffer;
           transfer.receivedBytes += buffer.byteLength;
@@ -331,30 +374,40 @@ export function App() {
           }
         }
 
-        setIncomingFile((current) => {
-          if (!current || current.transferId !== transfer.transferId) {
-            return current;
-          }
+        const now = performance.now();
+        const shouldUpdateUi =
+          now - lastIncomingUiUpdateRef.current >= UI_UPDATE_INTERVAL_MS || transfer.receivedChunks === transfer.totalChunks;
+        if (shouldUpdateUi) {
+          setIncomingFile((current) => {
+            if (!current || current.transferId !== transfer.transferId) {
+              return current;
+            }
 
-          return {
-            ...current,
-            receivedBytes: transfer.receivedBytes,
-            receivedChunks: transfer.receivedChunks,
-          };
-        });
+            return {
+              ...current,
+              receivedBytes: transfer.receivedBytes,
+              receivedChunks: transfer.receivedChunks,
+            };
+          });
+          lastIncomingUiUpdateRef.current = now;
+        }
 
         if (
           transfer.receivedChunks % ACK_EVERY_CHUNKS === 0 ||
           transfer.receivedChunks === transfer.totalChunks
         ) {
-          sendControlMessage({
-            type: 'file-ack',
-            payload: {
-              transferId: transfer.transferId,
-              receivedUpToChunkIndex: transfer.highestContiguousChunk,
-              receivedBytes: transfer.receivedBytes,
-            },
-          });
+          try {
+            sendControlMessage({
+              type: 'file-ack',
+              payload: {
+                transferId: transfer.transferId,
+                receivedUpToChunkIndex: transfer.highestContiguousChunk,
+                receivedBytes: transfer.receivedBytes,
+              },
+            });
+          } catch {
+            pushErrorToast('Failed to send file ACK');
+          }
         }
 
         pendingIncomingChunkRef.current = null;
@@ -613,6 +666,10 @@ export function App() {
     try {
       const transferId = crypto.randomUUID();
       const totalChunks = Math.ceil(selectedFile.size / CHUNK_SIZE_BYTES);
+      const startedAt = performance.now();
+      let peakBufferedAmount = 0;
+      lastOutgoingUiUpdateRef.current = startedAt;
+      setTransferMetrics(null);
       setTransferStatus(`Starting transfer for ${selectedFile.name}`);
 
       sendControlMessage({
@@ -628,8 +685,6 @@ export function App() {
       });
 
       for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
-        await waitForBufferToDrain(channel);
-
         const start = chunkIndex * CHUNK_SIZE_BYTES;
         const end = Math.min(start + CHUNK_SIZE_BYTES, selectedFile.size);
         const chunkBuffer = await selectedFile.slice(start, end).arrayBuffer();
@@ -646,10 +701,19 @@ export function App() {
         });
 
         channel.send(chunkBuffer);
+        peakBufferedAmount = Math.max(peakBufferedAmount, channel.bufferedAmount);
 
-        setTransferStatus(
-          `Sending ${selectedFile.name}: ${chunkIndex + 1}/${totalChunks} chunks (${end}/${selectedFile.size} bytes)`
-        );
+        if (channel.bufferedAmount > BUFFER_HIGH_WATERMARK_BYTES) {
+          await waitForBufferToDrain(channel);
+        }
+
+        const now = performance.now();
+        if (now - lastOutgoingUiUpdateRef.current >= UI_UPDATE_INTERVAL_MS || chunkIndex + 1 === totalChunks) {
+          setTransferStatus(
+            `Sending ${selectedFile.name}: ${chunkIndex + 1}/${totalChunks} chunks (${end}/${selectedFile.size} bytes)`
+          );
+          lastOutgoingUiUpdateRef.current = now;
+        }
       }
 
       sendControlMessage({
@@ -662,6 +726,15 @@ export function App() {
       });
 
       setTransferStatus(`Sent ${selectedFile.name}`);
+      const durationMs = performance.now() - startedAt;
+      setTransferMetrics({
+        direction: 'send',
+        fileName: selectedFile.name,
+        totalBytes: selectedFile.size,
+        durationMs,
+        speedMbps: toMbps(selectedFile.size, durationMs),
+        peakBufferedAmount,
+      });
     } catch {
       pushErrorToast('Failed to send file');
       setTransferStatus('Send failed');
@@ -790,6 +863,15 @@ export function App() {
         </div>
         <p className="transfer-note">Chunk size: {Math.round(CHUNK_SIZE_BYTES / 1024)} KB</p>
         <p className="transfer-note">Transfer status: {transferStatus}</p>
+        {transferMetrics ? (
+          <p className="transfer-note">
+            Last {transferMetrics.direction}: {transferMetrics.fileName} at {transferMetrics.speedMbps.toFixed(2)} Mbps in{' '}
+            {(transferMetrics.durationMs / 1000).toFixed(2)}s
+            {typeof transferMetrics.peakBufferedAmount === 'number'
+              ? ` (peak buffer ${Math.round(transferMetrics.peakBufferedAmount / 1024)} KB)`
+              : ''}
+          </p>
+        ) : null}
         {selectedFile ? (
           <p className="transfer-note">
             Selected: {selectedFile.name} ({Math.ceil(selectedFile.size / 1024)} KB)

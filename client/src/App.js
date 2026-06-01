@@ -5,10 +5,11 @@ import { socketEvents } from './lib/socket/socketEvents';
 import { createDataChannel } from './lib/webrtc/dataChannel';
 import { createPeerConnection } from './lib/webrtc/peerConnection';
 import './styles/global.css';
-const CHUNK_SIZE_BYTES = 64 * 1024;
-const BUFFER_HIGH_WATERMARK_BYTES = 1 * 1024 * 1024;
-const BUFFER_LOW_WATERMARK_BYTES = 256 * 1024;
-const ACK_EVERY_CHUNKS = 8;
+const CHUNK_SIZE_BYTES = 128 * 1024;
+const BUFFER_HIGH_WATERMARK_BYTES = 4 * 1024 * 1024;
+const BUFFER_LOW_WATERMARK_BYTES = 1 * 1024 * 1024;
+const ACK_EVERY_CHUNKS = 32;
+const UI_UPDATE_INTERVAL_MS = 150;
 export function App() {
     const [socketId, setSocketId] = useState(socketClient.id ?? null);
     const [isConnected, setIsConnected] = useState(socketClient.connected);
@@ -25,10 +26,13 @@ export function App() {
     const [selectedFile, setSelectedFile] = useState(null);
     const [transferStatus, setTransferStatus] = useState('Idle');
     const [incomingFile, setIncomingFile] = useState(null);
+    const [transferMetrics, setTransferMetrics] = useState(null);
     const peerConnectionRef = useRef(null);
     const dataChannelRef = useRef(null);
     const incomingTransfersRef = useRef(new Map());
     const pendingIncomingChunkRef = useRef(null);
+    const lastIncomingUiUpdateRef = useRef(0);
+    const lastOutgoingUiUpdateRef = useRef(0);
     function safeParsePeerMessage(raw) {
         try {
             const parsed = JSON.parse(raw);
@@ -47,6 +51,13 @@ export function App() {
             throw new Error('DataChannel is not open');
         }
         channel.send(JSON.stringify(message));
+    }
+    function toMbps(totalBytes, durationMs) {
+        if (durationMs <= 0) {
+            return 0;
+        }
+        const bits = totalBytes * 8;
+        return bits / (durationMs / 1000) / 1_000_000;
     }
     function waitForBufferToDrain(channel) {
         if (channel.bufferedAmount <= BUFFER_HIGH_WATERMARK_BYTES) {
@@ -131,6 +142,7 @@ export function App() {
                 }
                 if (message.type === 'file-start') {
                     const payload = message.payload;
+                    setTransferMetrics(null);
                     const incomingTransfer = {
                         transferId: payload.transferId,
                         fileName: payload.fileName,
@@ -141,6 +153,7 @@ export function App() {
                         receivedBytes: 0,
                         receivedChunks: 0,
                         highestContiguousChunk: -1,
+                        startedAt: performance.now(),
                     };
                     incomingTransfersRef.current.set(payload.transferId, incomingTransfer);
                     setIncomingFile((current) => {
@@ -170,8 +183,12 @@ export function App() {
                     return;
                 }
                 if (message.type === 'file-ack') {
-                    const ackedChunks = message.payload.receivedUpToChunkIndex + 1;
-                    setTransferStatus(`Peer ACK: ${ackedChunks} chunks (${message.payload.receivedBytes} bytes)`);
+                    const now = performance.now();
+                    if (now - lastOutgoingUiUpdateRef.current >= UI_UPDATE_INTERVAL_MS) {
+                        const ackedChunks = message.payload.receivedUpToChunkIndex + 1;
+                        setTransferStatus(`Peer ACK: ${ackedChunks} chunks (${message.payload.receivedBytes} bytes)`);
+                        lastOutgoingUiUpdateRef.current = now;
+                    }
                     return;
                 }
                 if (message.type === 'file-error') {
@@ -220,6 +237,14 @@ export function App() {
                         };
                     });
                     setTransferStatus('File received');
+                    const durationMs = performance.now() - transfer.startedAt;
+                    setTransferMetrics({
+                        direction: 'receive',
+                        fileName: transfer.fileName,
+                        totalBytes: blob.size,
+                        durationMs,
+                        speedMbps: toMbps(blob.size, durationMs),
+                    });
                     incomingTransfersRef.current.delete(payload.transferId);
                     pendingIncomingChunkRef.current = null;
                 }
@@ -242,6 +267,11 @@ export function App() {
                     pendingIncomingChunkRef.current = null;
                     return;
                 }
+                if (buffer.byteLength !== pendingHeader.chunkByteLength) {
+                    pushErrorToast('Chunk size mismatch received');
+                    pendingIncomingChunkRef.current = null;
+                    return;
+                }
                 if (transfer.chunks[pendingHeader.chunkIndex] === null) {
                     transfer.chunks[pendingHeader.chunkIndex] = buffer;
                     transfer.receivedBytes += buffer.byteLength;
@@ -251,26 +281,36 @@ export function App() {
                         transfer.highestContiguousChunk += 1;
                     }
                 }
-                setIncomingFile((current) => {
-                    if (!current || current.transferId !== transfer.transferId) {
-                        return current;
-                    }
-                    return {
-                        ...current,
-                        receivedBytes: transfer.receivedBytes,
-                        receivedChunks: transfer.receivedChunks,
-                    };
-                });
+                const now = performance.now();
+                const shouldUpdateUi = now - lastIncomingUiUpdateRef.current >= UI_UPDATE_INTERVAL_MS || transfer.receivedChunks === transfer.totalChunks;
+                if (shouldUpdateUi) {
+                    setIncomingFile((current) => {
+                        if (!current || current.transferId !== transfer.transferId) {
+                            return current;
+                        }
+                        return {
+                            ...current,
+                            receivedBytes: transfer.receivedBytes,
+                            receivedChunks: transfer.receivedChunks,
+                        };
+                    });
+                    lastIncomingUiUpdateRef.current = now;
+                }
                 if (transfer.receivedChunks % ACK_EVERY_CHUNKS === 0 ||
                     transfer.receivedChunks === transfer.totalChunks) {
-                    sendControlMessage({
-                        type: 'file-ack',
-                        payload: {
-                            transferId: transfer.transferId,
-                            receivedUpToChunkIndex: transfer.highestContiguousChunk,
-                            receivedBytes: transfer.receivedBytes,
-                        },
-                    });
+                    try {
+                        sendControlMessage({
+                            type: 'file-ack',
+                            payload: {
+                                transferId: transfer.transferId,
+                                receivedUpToChunkIndex: transfer.highestContiguousChunk,
+                                receivedBytes: transfer.receivedBytes,
+                            },
+                        });
+                    }
+                    catch {
+                        pushErrorToast('Failed to send file ACK');
+                    }
                 }
                 pendingIncomingChunkRef.current = null;
             };
@@ -486,6 +526,10 @@ export function App() {
         try {
             const transferId = crypto.randomUUID();
             const totalChunks = Math.ceil(selectedFile.size / CHUNK_SIZE_BYTES);
+            const startedAt = performance.now();
+            let peakBufferedAmount = 0;
+            lastOutgoingUiUpdateRef.current = startedAt;
+            setTransferMetrics(null);
             setTransferStatus(`Starting transfer for ${selectedFile.name}`);
             sendControlMessage({
                 type: 'file-start',
@@ -499,7 +543,6 @@ export function App() {
                 },
             });
             for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
-                await waitForBufferToDrain(channel);
                 const start = chunkIndex * CHUNK_SIZE_BYTES;
                 const end = Math.min(start + CHUNK_SIZE_BYTES, selectedFile.size);
                 const chunkBuffer = await selectedFile.slice(start, end).arrayBuffer();
@@ -514,7 +557,15 @@ export function App() {
                     },
                 });
                 channel.send(chunkBuffer);
-                setTransferStatus(`Sending ${selectedFile.name}: ${chunkIndex + 1}/${totalChunks} chunks (${end}/${selectedFile.size} bytes)`);
+                peakBufferedAmount = Math.max(peakBufferedAmount, channel.bufferedAmount);
+                if (channel.bufferedAmount > BUFFER_HIGH_WATERMARK_BYTES) {
+                    await waitForBufferToDrain(channel);
+                }
+                const now = performance.now();
+                if (now - lastOutgoingUiUpdateRef.current >= UI_UPDATE_INTERVAL_MS || chunkIndex + 1 === totalChunks) {
+                    setTransferStatus(`Sending ${selectedFile.name}: ${chunkIndex + 1}/${totalChunks} chunks (${end}/${selectedFile.size} bytes)`);
+                    lastOutgoingUiUpdateRef.current = now;
+                }
             }
             sendControlMessage({
                 type: 'file-complete',
@@ -525,6 +576,15 @@ export function App() {
                 },
             });
             setTransferStatus(`Sent ${selectedFile.name}`);
+            const durationMs = performance.now() - startedAt;
+            setTransferMetrics({
+                direction: 'send',
+                fileName: selectedFile.name,
+                totalBytes: selectedFile.size,
+                durationMs,
+                speedMbps: toMbps(selectedFile.size, durationMs),
+                peakBufferedAmount,
+            });
         }
         catch {
             pushErrorToast('Failed to send file');
@@ -557,5 +617,7 @@ export function App() {
     }, []);
     return (_jsxs("main", { className: "app-shell", children: [_jsx("aside", { className: "toast-stack", "aria-live": "polite", children: toasts.map((toast) => (_jsxs("div", { className: "toast toast-error", children: [_jsx("span", { children: toast.message }), _jsx("button", { className: "toast-close", onClick: () => removeToast(toast.id), children: "x" })] }, toast.id))) }), _jsxs("section", { className: "hero-card", children: [_jsx("p", { className: "eyebrow", children: "PeerPair / Phase 2" }), _jsx("h1", { children: "Realtime Peer Signaling Playground" }), _jsx("p", { className: "hero-copy", children: "Create a room, join with a second browser, and watch signaling + DataChannel state update live." })] }), _jsxs("section", { className: "panel room-panel", children: [_jsx("h2", { children: "Room Control" }), _jsxs("div", { className: "room-actions", children: [_jsx("button", { className: "btn primary", onClick: handleCreateRoom, children: "Create Room" }), _jsx("button", { className: "btn", onClick: handleJoinRoom, children: "Join Room" }), _jsx("button", { className: "btn danger", onClick: handleLeaveRoom, children: "Leave Room" })] }), _jsx("input", { className: "field", type: "text", placeholder: "Enter room ID", value: roomId, onChange: (event) => setRoomId(event.target.value) }), _jsxs("div", { className: "badge-row", children: [_jsxs("span", { className: "badge", children: ["Active: ", joinedRoomId ?? 'None'] }), _jsxs("span", { className: "badge", children: ["Peers: ", peers.length] })] })] }), _jsxs("section", { className: "panel grid-panel", children: [_jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "Socket" }), _jsx("p", { className: `value ${isConnected ? 'ok' : 'bad'}`, children: isConnected ? 'Connected' : 'Disconnected' })] }), _jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "WebRTC" }), _jsx("p", { className: "value", children: rtcState })] }), _jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "DataChannel" }), _jsx("p", { className: "value", children: channelState })] }), _jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "Room Status" }), _jsx("p", { className: "value", children: statusMessage })] })] }), _jsxs("section", { className: "panel chat-panel", children: [_jsx("h2", { children: "DataChannel Chat" }), _jsxs("div", { className: "chat-row", children: [_jsx("input", { className: "field", type: "text", placeholder: "Send message over DataChannel", value: chatMessage, onChange: (event) => setChatMessage(event.target.value) }), _jsx("button", { className: "btn primary", onClick: handleSendMessage, children: "Send" })] }), _jsxs("div", { className: "log-box", children: [chatLog.length === 0 ? _jsx("p", { className: "log-empty", children: "No messages yet" }) : null, chatLog.map((entry, index) => (_jsx("p", { className: "log-line", children: entry }, `${entry}-${index}`)))] })] }), _jsxs("section", { className: "panel transfer-panel", children: [_jsx("h2", { children: "Chunked File Transfer (Phase 5)" }), _jsxs("div", { className: "transfer-row", children: [_jsx("input", { className: "field", type: "file", onChange: (event) => {
                                     setSelectedFile(event.target.files?.[0] ?? null);
-                                } }), _jsx("button", { className: "btn primary", onClick: () => void handleSendFile(), children: "Send File" })] }), _jsxs("p", { className: "transfer-note", children: ["Chunk size: ", Math.round(CHUNK_SIZE_BYTES / 1024), " KB"] }), _jsxs("p", { className: "transfer-note", children: ["Transfer status: ", transferStatus] }), selectedFile ? (_jsxs("p", { className: "transfer-note", children: ["Selected: ", selectedFile.name, " (", Math.ceil(selectedFile.size / 1024), " KB)"] })) : null, incomingFile ? (_jsxs("div", { className: "incoming-card", children: [_jsxs("p", { children: ["Incoming: ", incomingFile.fileName] }), _jsxs("p", { children: ["Received: ", incomingFile.receivedBytes, " / ", incomingFile.fileSize, " bytes"] }), _jsxs("p", { children: ["Chunks: ", incomingFile.receivedChunks, " / ", incomingFile.totalChunks] }), incomingFile.downloadUrl ? (_jsx("a", { className: "btn", href: incomingFile.downloadUrl, download: incomingFile.fileName, children: "Download Received File" })) : null] })) : null] }), _jsxs("footer", { className: "meta", children: [_jsxs("span", { children: ["Socket ID: ", socketId ?? 'N/A'] }), _jsxs("span", { children: ["Handshake: ", pongMessage] })] })] }));
+                                } }), _jsx("button", { className: "btn primary", onClick: () => void handleSendFile(), children: "Send File" })] }), _jsxs("p", { className: "transfer-note", children: ["Chunk size: ", Math.round(CHUNK_SIZE_BYTES / 1024), " KB"] }), _jsxs("p", { className: "transfer-note", children: ["Transfer status: ", transferStatus] }), transferMetrics ? (_jsxs("p", { className: "transfer-note", children: ["Last ", transferMetrics.direction, ": ", transferMetrics.fileName, " at ", transferMetrics.speedMbps.toFixed(2), " Mbps in", ' ', (transferMetrics.durationMs / 1000).toFixed(2), "s", typeof transferMetrics.peakBufferedAmount === 'number'
+                                ? ` (peak buffer ${Math.round(transferMetrics.peakBufferedAmount / 1024)} KB)`
+                                : ''] })) : null, selectedFile ? (_jsxs("p", { className: "transfer-note", children: ["Selected: ", selectedFile.name, " (", Math.ceil(selectedFile.size / 1024), " KB)"] })) : null, incomingFile ? (_jsxs("div", { className: "incoming-card", children: [_jsxs("p", { children: ["Incoming: ", incomingFile.fileName] }), _jsxs("p", { children: ["Received: ", incomingFile.receivedBytes, " / ", incomingFile.fileSize, " bytes"] }), _jsxs("p", { children: ["Chunks: ", incomingFile.receivedChunks, " / ", incomingFile.totalChunks] }), incomingFile.downloadUrl ? (_jsx("a", { className: "btn", href: incomingFile.downloadUrl, download: incomingFile.fileName, children: "Download Received File" })) : null] })) : null] }), _jsxs("footer", { className: "meta", children: [_jsxs("span", { children: ["Socket ID: ", socketId ?? 'N/A'] }), _jsxs("span", { children: ["Handshake: ", pongMessage] })] })] }));
 }
