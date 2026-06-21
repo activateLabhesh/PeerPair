@@ -5,7 +5,7 @@ import { socketEvents } from './lib/socket/socketEvents';
 import { createDataChannel } from './lib/webrtc/dataChannel';
 import { createPeerConnection } from './lib/webrtc/peerConnection';
 import './styles/global.css';
-const CHUNK_SIZE_BYTES = 64 * 1024;
+const CHUNK_SIZE_BYTES = 256 * 1024;
 const BUFFER_HIGH_WATERMARK_BYTES = 4 * 1024 * 1024;
 const BUFFER_LOW_WATERMARK_BYTES = 1 * 1024 * 1024;
 const UI_UPDATE_INTERVAL_MS = 150;
