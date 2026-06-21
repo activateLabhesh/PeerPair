@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { FileCompletePeerMessage, FileStartPeerMessage, PeerMessage, RoomStatePayload, SignalPayload } from '@peerpair/shared';
+import type { FileCompletePeerMessage, FileMetadataPeerMessage, PeerMessage, RoomStatePayload, SignalPayload } from '@peerpair/shared';
 import { socketClient } from './lib/socket/socketClient';
 import { socketEvents } from './lib/socket/socketEvents';
 import { createDataChannel } from './lib/webrtc/dataChannel';
@@ -17,8 +17,6 @@ type IncomingFileState = {
   fileSize: number;
   mimeType: string;
   receivedBytes: number;
-  receivedChunks: number;
-  totalChunks: number;
   downloadUrl: string | null;
 };
 
@@ -27,11 +25,8 @@ type IncomingTransferBuffer = {
   fileName: string;
   fileSize: number;
   mimeType: string;
-  totalChunks: number;
-  chunks: Array<ArrayBuffer | null>;
+  chunks: Array<ArrayBuffer>;
   receivedBytes: number;
-  receivedChunks: number;
-  highestContiguousChunk: number;
   startedAt: number;
 };
 
@@ -44,11 +39,13 @@ type TransferMetrics = {
   peakBufferedAmount?: number;
 };
 
-const CHUNK_SIZE_BYTES = 128 * 1024;
+const CHUNK_SIZE_BYTES = 64 * 1024;
 const BUFFER_HIGH_WATERMARK_BYTES = 4 * 1024 * 1024;
 const BUFFER_LOW_WATERMARK_BYTES = 1 * 1024 * 1024;
-const ACK_EVERY_CHUNKS = 32;
 const UI_UPDATE_INTERVAL_MS = 150;
+const MAX_CONNECTION_RETRIES = 4;
+const RETRY_BASE_DELAY_MS = 1200;
+const DATA_CHANNEL_OPEN_TIMEOUT_MS = 12000;
 
 export function App() {
   const [socketId, setSocketId] = useState<string | null>(socketClient.id ?? null);
@@ -71,13 +68,58 @@ export function App() {
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
   const incomingTransfersRef = useRef<Map<string, IncomingTransferBuffer>>(new Map());
-  const pendingIncomingChunkRef = useRef<{
-    transferId: string;
-    chunkIndex: number;
-    chunkByteLength: number;
-  } | null>(null);
   const lastIncomingUiUpdateRef = useRef<number>(0);
   const lastOutgoingUiUpdateRef = useRef<number>(0);
+  const retryAttemptRef = useRef<number>(0);
+  const retryTimerRef = useRef<number | null>(null);
+  const dataChannelOpenTimerRef = useRef<number | null>(null);
+  const isIntentionalLeaveRef = useRef<boolean>(false);
+  const retryInProgressRef = useRef<boolean>(false);
+  const shouldCreateOfferRef = useRef<boolean>(false);
+
+  function clearRetryTimer() {
+    if (retryTimerRef.current !== null) {
+      window.clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+  }
+
+  function clearDataChannelOpenTimer() {
+    if (dataChannelOpenTimerRef.current !== null) {
+      window.clearTimeout(dataChannelOpenTimerRef.current);
+      dataChannelOpenTimerRef.current = null;
+    }
+  }
+
+  function resetRetryState() {
+    clearRetryTimer();
+    clearDataChannelOpenTimer();
+    retryAttemptRef.current = 0;
+    retryInProgressRef.current = false;
+  }
+
+  function cleanupConnectionOnly() {
+    clearDataChannelOpenTimer();
+    if (dataChannelRef.current) {
+      dataChannelRef.current.onopen = null;
+      dataChannelRef.current.onclose = null;
+      dataChannelRef.current.onmessage = null;
+      dataChannelRef.current.close();
+      dataChannelRef.current = null;
+    }
+
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.onicecandidate = null;
+      peerConnectionRef.current.onconnectionstatechange = null;
+      peerConnectionRef.current.ondatachannel = null;
+      peerConnectionRef.current.oniceconnectionstatechange = null;
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
+
+    setRtcState('closed');
+    setChannelState('closed');
+  }
 
   function safeParsePeerMessage(raw: string): PeerMessage | null {
     try {
@@ -132,7 +174,6 @@ export function App() {
 
   function clearIncomingTransfers() {
     incomingTransfersRef.current.clear();
-    pendingIncomingChunkRef.current = null;
     setIncomingFile((current) => {
       if (current?.downloadUrl) {
         URL.revokeObjectURL(current.downloadUrl);
@@ -159,25 +200,47 @@ export function App() {
     }, 3600);
   }
 
+  function scheduleReconnect(reason: string) {
+    if (isIntentionalLeaveRef.current || !joinedRoomId) {
+      return;
+    }
+
+    if (retryInProgressRef.current) {
+      return;
+    }
+
+    if (retryAttemptRef.current >= MAX_CONNECTION_RETRIES) {
+      setStatusMessage(`WebRTC reconnect failed after ${MAX_CONNECTION_RETRIES} retries`);
+      pushErrorToast('Connection failed after retries. Please try leaving and rejoining.');
+      return;
+    }
+
+    retryInProgressRef.current = true;
+    retryAttemptRef.current += 1;
+    const jitter = Math.floor(Math.random() * 300);
+    const delay = RETRY_BASE_DELAY_MS * 2 ** (retryAttemptRef.current - 1) + jitter;
+    setStatusMessage(`Reconnecting (${retryAttemptRef.current}/${MAX_CONNECTION_RETRIES})...`);
+    addChatLog(`[system] Reconnect scheduled (${reason}) in ${Math.round(delay)}ms`);
+
+    cleanupConnectionOnly();
+    clearRetryTimer();
+    retryTimerRef.current = window.setTimeout(() => {
+      retryInProgressRef.current = false;
+      if (!joinedRoomId || isIntentionalLeaveRef.current) {
+        return;
+      }
+
+      if (shouldCreateOfferRef.current) {
+        void createAndSendOffer(joinedRoomId);
+      } else {
+        ensurePeerConnection(joinedRoomId);
+      }
+    }, delay);
+  }
+
   function cleanupPeerConnection() {
-    if (dataChannelRef.current) {
-      dataChannelRef.current.onopen = null;
-      dataChannelRef.current.onclose = null;
-      dataChannelRef.current.onmessage = null;
-      dataChannelRef.current.close();
-      dataChannelRef.current = null;
-    }
-
-    if (peerConnectionRef.current) {
-      peerConnectionRef.current.onicecandidate = null;
-      peerConnectionRef.current.onconnectionstatechange = null;
-      peerConnectionRef.current.ondatachannel = null;
-      peerConnectionRef.current.close();
-      peerConnectionRef.current = null;
-    }
-
-    setRtcState('closed');
-    setChannelState('closed');
+    resetRetryState();
+    cleanupConnectionOnly();
     clearIncomingTransfers();
   }
 
@@ -187,13 +250,17 @@ export function App() {
     setChannelState(channel.readyState);
 
     channel.onopen = () => {
+      clearDataChannelOpenTimer();
+      resetRetryState();
       setChannelState(channel.readyState);
+      setStatusMessage('Peer connection established');
       addChatLog('[system] DataChannel open');
     };
 
     channel.onclose = () => {
       setChannelState(channel.readyState);
       addChatLog('[system] DataChannel closed');
+      scheduleReconnect('datachannel closed');
     };
 
     channel.onmessage = (event) => {
@@ -209,19 +276,16 @@ export function App() {
           return;
         }
 
-        if (message.type === 'file-start') {
-          const payload = (message as FileStartPeerMessage).payload;
+        if (message.type === 'file-metadata') {
+          const payload = (message as FileMetadataPeerMessage).payload;
           setTransferMetrics(null);
           const incomingTransfer: IncomingTransferBuffer = {
             transferId: payload.transferId,
             fileName: payload.fileName,
             fileSize: payload.fileSize,
             mimeType: payload.mimeType,
-            totalChunks: payload.totalChunks,
-            chunks: new Array<ArrayBuffer | null>(payload.totalChunks).fill(null),
+            chunks: [],
             receivedBytes: 0,
-            receivedChunks: 0,
-            highestContiguousChunk: -1,
             startedAt: performance.now(),
           };
 
@@ -238,8 +302,6 @@ export function App() {
               fileSize: payload.fileSize,
               mimeType: payload.mimeType,
               receivedBytes: 0,
-              receivedChunks: 0,
-              totalChunks: payload.totalChunks,
               downloadUrl: null,
             };
           });
@@ -247,136 +309,27 @@ export function App() {
           return;
         }
 
-        if (message.type === 'file-chunk') {
-          pendingIncomingChunkRef.current = {
-            transferId: message.payload.transferId,
-            chunkIndex: message.payload.chunkIndex,
-            chunkByteLength: message.payload.chunkByteLength,
-          };
-          return;
-        }
-
-        if (message.type === 'file-ack') {
-          const now = performance.now();
-          if (now - lastOutgoingUiUpdateRef.current >= UI_UPDATE_INTERVAL_MS) {
-            const ackedChunks = message.payload.receivedUpToChunkIndex + 1;
-            setTransferStatus(`Peer ACK: ${ackedChunks} chunks (${message.payload.receivedBytes} bytes)`);
-            lastOutgoingUiUpdateRef.current = now;
-          }
-          return;
-        }
-
-        if (message.type === 'file-error') {
-          setTransferStatus(`Transfer failed: ${message.payload.message}`);
-          pushErrorToast(`Peer transfer error: ${message.payload.message}`);
-          return;
-        }
-
-        if (message.type === 'file-cancel') {
-          setTransferStatus(`Transfer canceled: ${message.payload.reason ?? 'peer canceled'}`);
-          pushErrorToast(`Peer canceled transfer${message.payload.reason ? `: ${message.payload.reason}` : ''}`);
-          clearIncomingTransfers();
-          return;
-        }
-
         if (message.type === 'file-complete') {
-          const payload = (message as FileCompletePeerMessage).payload;
-          const transfer = incomingTransfersRef.current.get(payload.transferId);
-          if (!transfer) {
-            pushErrorToast('Transfer complete received without matching file-start');
-            return;
-          }
-
-          if (transfer.receivedBytes !== payload.totalBytes || transfer.receivedChunks !== payload.totalChunks) {
-            pushErrorToast('Received file size/chunk count does not match completion message');
-            setTransferStatus('Receive failed: transfer mismatch');
-            return;
-          }
-
-          const finalizedChunks = transfer.chunks.filter((chunk): chunk is ArrayBuffer => chunk !== null);
-          const blob = new Blob(finalizedChunks, { type: transfer.mimeType || 'application/octet-stream' });
-
-          if (blob.size !== payload.totalBytes) {
-            pushErrorToast('Received file size does not match completion payload');
-            setTransferStatus('Receive failed: size mismatch');
-            return;
-          }
-
-          const downloadUrl = URL.createObjectURL(blob);
-          setIncomingFile((current) => {
-            if (!current) {
-              return current;
-            }
-
-            if (current.downloadUrl) {
-              URL.revokeObjectURL(current.downloadUrl);
-            }
-
-            return {
-              ...current,
-              receivedBytes: blob.size,
-              receivedChunks: transfer.totalChunks,
-              downloadUrl,
-            };
-          });
-          setTransferStatus('File received');
-          const durationMs = performance.now() - transfer.startedAt;
-          setTransferMetrics({
-            direction: 'receive',
-            fileName: transfer.fileName,
-            totalBytes: blob.size,
-            durationMs,
-            speedMbps: toMbps(blob.size, durationMs),
-          });
-          incomingTransfersRef.current.delete(payload.transferId);
-          pendingIncomingChunkRef.current = null;
+          setTransferStatus('Transfer complete verified by receiver');
+          return;
         }
 
         return;
       }
 
       const processBinaryChunk = (buffer: ArrayBuffer) => {
-        const pendingHeader = pendingIncomingChunkRef.current;
-        if (!pendingHeader) {
-          pushErrorToast('Binary chunk received without file-chunk header');
-          return;
-        }
-
-        const transfer = incomingTransfersRef.current.get(pendingHeader.transferId);
+        const transfer = Array.from(incomingTransfersRef.current.values())[0];
         if (!transfer) {
           pushErrorToast('Binary chunk received for unknown transfer');
-          pendingIncomingChunkRef.current = null;
           return;
         }
 
-        if (pendingHeader.chunkIndex < 0 || pendingHeader.chunkIndex >= transfer.totalChunks) {
-          pushErrorToast('Invalid chunk index received');
-          pendingIncomingChunkRef.current = null;
-          return;
-        }
-
-        if (buffer.byteLength !== pendingHeader.chunkByteLength) {
-          pushErrorToast('Chunk size mismatch received');
-          pendingIncomingChunkRef.current = null;
-          return;
-        }
-
-        if (transfer.chunks[pendingHeader.chunkIndex] === null) {
-          transfer.chunks[pendingHeader.chunkIndex] = buffer;
-          transfer.receivedBytes += buffer.byteLength;
-          transfer.receivedChunks += 1;
-
-          while (
-            transfer.highestContiguousChunk + 1 < transfer.totalChunks &&
-            transfer.chunks[transfer.highestContiguousChunk + 1] !== null
-          ) {
-            transfer.highestContiguousChunk += 1;
-          }
-        }
+        transfer.chunks.push(buffer);
+        transfer.receivedBytes += buffer.byteLength;
 
         const now = performance.now();
         const shouldUpdateUi =
-          now - lastIncomingUiUpdateRef.current >= UI_UPDATE_INTERVAL_MS || transfer.receivedChunks === transfer.totalChunks;
+          now - lastIncomingUiUpdateRef.current >= UI_UPDATE_INTERVAL_MS || transfer.receivedBytes >= transfer.fileSize;
         if (shouldUpdateUi) {
           setIncomingFile((current) => {
             if (!current || current.transferId !== transfer.transferId) {
@@ -386,31 +339,54 @@ export function App() {
             return {
               ...current,
               receivedBytes: transfer.receivedBytes,
-              receivedChunks: transfer.receivedChunks,
             };
           });
           lastIncomingUiUpdateRef.current = now;
         }
 
-        if (
-          transfer.receivedChunks % ACK_EVERY_CHUNKS === 0 ||
-          transfer.receivedChunks === transfer.totalChunks
-        ) {
+        if (transfer.receivedBytes >= transfer.fileSize) {
+          const blob = new Blob(transfer.chunks, { type: transfer.mimeType || 'application/octet-stream' });
+
+          if (blob.size !== transfer.fileSize) {
+            pushErrorToast('Received file size does not match');
+            setTransferStatus('Receive failed: size mismatch');
+            return;
+          }
+
           try {
             sendControlMessage({
-              type: 'file-ack',
+              type: 'file-complete',
               payload: {
                 transferId: transfer.transferId,
-                receivedUpToChunkIndex: transfer.highestContiguousChunk,
-                receivedBytes: transfer.receivedBytes,
+                totalBytes: blob.size,
               },
             });
           } catch {
-            pushErrorToast('Failed to send file ACK');
+            pushErrorToast('Failed to send file-complete');
           }
-        }
 
-        pendingIncomingChunkRef.current = null;
+          const downloadUrl = URL.createObjectURL(blob);
+          setIncomingFile((current) => {
+            if (!current) return current;
+            if (current.downloadUrl) URL.revokeObjectURL(current.downloadUrl);
+            return {
+              ...current,
+              receivedBytes: blob.size,
+              downloadUrl,
+            };
+          });
+
+          setTransferStatus('File received');
+          const durationMs = performance.now() - transfer.startedAt;
+          setTransferMetrics({
+            direction: 'receive',
+            fileName: transfer.fileName,
+            totalBytes: blob.size,
+            durationMs,
+            speedMbps: toMbps(blob.size, durationMs),
+          });
+          incomingTransfersRef.current.delete(transfer.transferId);
+        }
       };
 
       if (event.data instanceof ArrayBuffer) {
@@ -445,6 +421,15 @@ export function App() {
 
     peerConnection.onconnectionstatechange = () => {
       setRtcState(peerConnection.connectionState);
+      if (peerConnection.connectionState === 'failed') {
+        scheduleReconnect('peer connection failed');
+      }
+    };
+
+    peerConnection.oniceconnectionstatechange = () => {
+      if (peerConnection.iceConnectionState === 'failed') {
+        scheduleReconnect('ice connection failed');
+      }
     };
 
     peerConnection.ondatachannel = (event) => {
@@ -457,6 +442,7 @@ export function App() {
   }
 
   async function createAndSendOffer(activeRoomId: string) {
+    shouldCreateOfferRef.current = true;
     const peerConnection = ensurePeerConnection(activeRoomId);
 
     if (!dataChannelRef.current) {
@@ -467,6 +453,13 @@ export function App() {
     const offer = await peerConnection.createOffer();
     await peerConnection.setLocalDescription(offer);
 
+    clearDataChannelOpenTimer();
+    dataChannelOpenTimerRef.current = window.setTimeout(() => {
+      if (dataChannelRef.current?.readyState !== 'open') {
+        scheduleReconnect('datachannel open timeout');
+      }
+    }, DATA_CHANNEL_OPEN_TIMEOUT_MS);
+
     socketClient.emit(socketEvents.offer, {
       roomId: activeRoomId,
       fromPeerId: socketClient.id ?? '',
@@ -476,6 +469,7 @@ export function App() {
 
   useEffect(() => {
     function onRoomState(payload: RoomStatePayload) {
+      isIntentionalLeaveRef.current = false;
       setJoinedRoomId(payload.roomId);
       setRoomId(payload.roomId);
       setPeers(payload.peers);
@@ -517,11 +511,19 @@ export function App() {
       }
 
       try {
+        shouldCreateOfferRef.current = false;
         const peerConnection = ensurePeerConnection(payload.roomId);
         await peerConnection.setRemoteDescription(payload.data as RTCSessionDescriptionInit);
 
         const answer = await peerConnection.createAnswer();
         await peerConnection.setLocalDescription(answer);
+
+        clearDataChannelOpenTimer();
+        dataChannelOpenTimerRef.current = window.setTimeout(() => {
+          if (dataChannelRef.current?.readyState !== 'open') {
+            scheduleReconnect('receiver datachannel open timeout');
+          }
+        }, DATA_CHANNEL_OPEN_TIMEOUT_MS);
 
         socketClient.emit(socketEvents.answer, {
           roomId: payload.roomId,
@@ -573,6 +575,7 @@ export function App() {
 
   useEffect(() => {
     return () => {
+      isIntentionalLeaveRef.current = true;
       cleanupPeerConnection();
     };
   }, []);
@@ -601,6 +604,7 @@ export function App() {
         return;
       }
 
+      isIntentionalLeaveRef.current = false;
       setStatusMessage(`Joined room ${targetRoomId}`);
       void createAndSendOffer(targetRoomId);
     });
@@ -613,6 +617,8 @@ export function App() {
       return;
     }
 
+    isIntentionalLeaveRef.current = true;
+    shouldCreateOfferRef.current = false;
     socketClient.emit(socketEvents.leaveRoom, joinedRoomId, (ack) => {
       if (!ack?.ok) {
         setStatusMessage(ack?.message ?? 'Failed to leave room');
@@ -665,7 +671,6 @@ export function App() {
 
     try {
       const transferId = crypto.randomUUID();
-      const totalChunks = Math.ceil(selectedFile.size / CHUNK_SIZE_BYTES);
       const startedAt = performance.now();
       let peakBufferedAmount = 0;
       lastOutgoingUiUpdateRef.current = startedAt;
@@ -673,59 +678,50 @@ export function App() {
       setTransferStatus(`Starting transfer for ${selectedFile.name}`);
 
       sendControlMessage({
-        type: 'file-start',
+        type: 'file-metadata',
         payload: {
           transferId,
           fileName: selectedFile.name,
           fileSize: selectedFile.size,
           mimeType: selectedFile.type || 'application/octet-stream',
-          chunkSize: CHUNK_SIZE_BYTES,
-          totalChunks,
         },
       });
 
-      for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
-        const start = chunkIndex * CHUNK_SIZE_BYTES;
-        const end = Math.min(start + CHUNK_SIZE_BYTES, selectedFile.size);
-        const chunkBuffer = await selectedFile.slice(start, end).arrayBuffer();
+      const stream = selectedFile.stream();
+      const reader = stream.getReader();
+      let sentBytes = 0;
 
-        sendControlMessage({
-          type: 'file-chunk',
-          payload: {
-            transferId,
-            chunkIndex,
-            totalChunks,
-            byteOffset: start,
-            chunkByteLength: chunkBuffer.byteLength,
-          },
-        });
-
-        channel.send(chunkBuffer);
-        peakBufferedAmount = Math.max(peakBufferedAmount, channel.bufferedAmount);
-
+      while (true) {
         if (channel.bufferedAmount > BUFFER_HIGH_WATERMARK_BYTES) {
           await waitForBufferToDrain(channel);
         }
 
-        const now = performance.now();
-        if (now - lastOutgoingUiUpdateRef.current >= UI_UPDATE_INTERVAL_MS || chunkIndex + 1 === totalChunks) {
-          setTransferStatus(
-            `Sending ${selectedFile.name}: ${chunkIndex + 1}/${totalChunks} chunks (${end}/${selectedFile.size} bytes)`
-          );
-          lastOutgoingUiUpdateRef.current = now;
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        let offset = 0;
+        while (offset < value.byteLength) {
+          if (channel.bufferedAmount > BUFFER_HIGH_WATERMARK_BYTES) {
+            await waitForBufferToDrain(channel);
+          }
+          const chunkByteLength = Math.min(CHUNK_SIZE_BYTES, value.byteLength - offset);
+          const chunk = value.subarray(offset, offset + chunkByteLength);
+          channel.send(chunk);
+          peakBufferedAmount = Math.max(peakBufferedAmount, channel.bufferedAmount);
+          sentBytes += chunkByteLength;
+          offset += chunkByteLength;
+
+          const now = performance.now();
+          if (now - lastOutgoingUiUpdateRef.current >= UI_UPDATE_INTERVAL_MS || sentBytes === selectedFile.size) {
+            setTransferStatus(`Sending ${selectedFile.name}: ${sentBytes}/${selectedFile.size} bytes`);
+            lastOutgoingUiUpdateRef.current = now;
+          }
         }
       }
 
-      sendControlMessage({
-        type: 'file-complete',
-        payload: {
-          transferId,
-          totalBytes: selectedFile.size,
-          totalChunks,
-        },
-      });
-
-      setTransferStatus(`Sent ${selectedFile.name}`);
+      setTransferStatus(`Sent all bytes for ${selectedFile.name}, waiting for receiver verification...`);
       const durationMs = performance.now() - startedAt;
       setTransferMetrics({
         direction: 'send',
@@ -882,9 +878,6 @@ export function App() {
             <p>Incoming: {incomingFile.fileName}</p>
             <p>
               Received: {incomingFile.receivedBytes} / {incomingFile.fileSize} bytes
-            </p>
-            <p>
-              Chunks: {incomingFile.receivedChunks} / {incomingFile.totalChunks}
             </p>
             {incomingFile.downloadUrl ? (
               <a className="btn" href={incomingFile.downloadUrl} download={incomingFile.fileName}>
