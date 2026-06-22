@@ -105,19 +105,29 @@ export function App() {
         return bits / (durationMs / 1000) / 1_000_000;
     }
     function waitForBufferToDrain(channel) {
+        if (channel.readyState !== 'open') {
+            return Promise.reject(new Error('Data channel is not open'));
+        }
         if (channel.bufferedAmount <= BUFFER_HIGH_WATERMARK_BYTES) {
             return Promise.resolve();
         }
-        return new Promise((resolve) => {
+        return new Promise((resolve, reject) => {
             const onLow = () => {
-                channel.removeEventListener('bufferedamountlow', onLow);
+                cleanup();
                 resolve();
             };
-            channel.addEventListener('bufferedamountlow', onLow);
-            window.setTimeout(() => {
+            const onClose = () => {
+                cleanup();
+                reject(new Error('Data channel closed while waiting for buffer to drain'));
+            };
+            const cleanup = () => {
                 channel.removeEventListener('bufferedamountlow', onLow);
-                resolve();
-            }, 1500);
+                channel.removeEventListener('close', onClose);
+                channel.removeEventListener('error', onClose);
+            };
+            channel.addEventListener('bufferedamountlow', onLow);
+            channel.addEventListener('close', onClose);
+            channel.addEventListener('error', onClose);
         });
     }
     function clearIncomingTransfers() {
