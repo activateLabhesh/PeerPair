@@ -48,16 +48,14 @@ const RETRY_BASE_DELAY_MS = 1200;
 const DATA_CHANNEL_OPEN_TIMEOUT_MS = 12000;
 
 export function App() {
-  const [socketId, setSocketId] = useState<string | null>(socketClient.id ?? null);
+  const [currentPage, setCurrentPage] = useState<'home' | 'share'>('home');
   const [isConnected, setIsConnected] = useState(socketClient.connected);
-  const [pongMessage, setPongMessage] = useState<string>('waiting');
   const [roomId, setRoomId] = useState<string>('');
   const [joinedRoomId, setJoinedRoomId] = useState<string | null>(null);
   const [peers, setPeers] = useState<string[]>([]);
   const [statusMessage, setStatusMessage] = useState<string>('Idle');
   const [rtcState, setRtcState] = useState<string>('new');
   const [channelState, setChannelState] = useState<string>('closed');
-  const [chatMessage, setChatMessage] = useState<string>('');
   const [chatLog, setChatLog] = useState<string[]>([]);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -150,6 +148,22 @@ export function App() {
 
     const bits = totalBytes * 8;
     return bits / (durationMs / 1000) / 1_000_000;
+  }
+
+  function formatBytes(totalBytes: number): string {
+    if (totalBytes >= 1024 * 1024 * 1024) {
+      return `${(totalBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+    }
+
+    if (totalBytes >= 1024 * 1024) {
+      return `${(totalBytes / (1024 * 1024)).toFixed(2)} MB`;
+    }
+
+    if (totalBytes >= 1024) {
+      return `${Math.ceil(totalBytes / 1024)} KB`;
+    }
+
+    return `${totalBytes} bytes`;
   }
 
   function waitForBufferToDrain(channel: RTCDataChannel): Promise<void> {
@@ -645,29 +659,6 @@ export function App() {
     });
   }
 
-  function handleSendMessage() {
-    const message = chatMessage.trim();
-    if (!message) {
-      return;
-    }
-
-    const channel = dataChannelRef.current;
-    if (!channel || channel.readyState !== 'open') {
-      setStatusMessage('DataChannel is not open yet');
-      pushErrorToast('DataChannel is not open yet');
-      return;
-    }
-
-    const textMessage: PeerMessage = {
-      type: 'text',
-      payload: { message },
-    };
-
-    channel.send(JSON.stringify(textMessage));
-    addChatLog(`[me] ${message}`);
-    setChatMessage('');
-  }
-
   async function handleSendFile() {
     if (!selectedFile) {
       pushErrorToast('Pick a file before sending');
@@ -753,53 +744,117 @@ export function App() {
 
     function onConnect() {
       setIsConnected(true);
-      setSocketId(socketClient.id ?? null);
-      socketClient.emit(socketEvents.ping, 'hello-phase-0', (response: { message: string }) => {
-        setPongMessage(response.message);
-      });
     }
 
     function onDisconnect() {
       setIsConnected(false);
-      setSocketId(null);
-    }
-
-    function onPong(message: string) {
-      setPongMessage(message);
     }
 
     socketClient.on('connect', onConnect);
     socketClient.on('disconnect', onDisconnect);
-    socketClient.on(socketEvents.pong, onPong);
 
     return () => {
       socketClient.off('connect', onConnect);
       socketClient.off('disconnect', onDisconnect);
-      socketClient.off(socketEvents.pong, onPong);
     };
   }, []);
 
-  return (
-    <main className="app-shell">
-      <aside className="toast-stack" aria-live="polite">
-        {toasts.map((toast) => (
-          <div className="toast toast-error" key={toast.id}>
-            <span>{toast.message}</span>
-            <button className="toast-close" onClick={() => removeToast(toast.id)}>x</button>
+  const homePage = (
+    <>
+      <section className="hero-card home-hero">
+        <div className="hero-content">
+          <p className="eyebrow"><span className="brand-mark">PP</span> PeerPair</p>
+          <h1>Private file sharing, <span>directly</span> between browsers</h1>
+          <p className="hero-copy">
+            PeerPair lets two people connect in a shared room and transfer files directly, with a simple workflow built for fast, secure handoffs.
+          </p>
+          <div className="room-actions hero-actions">
+            <button className="btn primary hero-cta" onClick={() => setCurrentPage('share')}>
+              <span aria-hidden="true">↥</span> Share Files
+            </button>
           </div>
-        ))}
-      </aside>
+        </div>
 
+        <div className="hero-visual" aria-hidden="true">
+          <div className="orbit orbit-left"></div>
+          <div className="orbit orbit-right"></div>
+          <div className="spark spark-one">✦</div>
+          <div className="spark spark-two">◆</div>
+          <div className="spark spark-three">✦</div>
+          <div className="file-card">
+            <span></span>
+            <span></span>
+            <span></span>
+          </div>
+          <div className="transfer-arc"></div>
+          <div className="check-bubble">✓</div>
+          <div className="laptop laptop-left">
+            <div className="laptop-screen">
+              <div className="avatar avatar-yellow">●</div>
+              <strong>You</strong>
+            </div>
+            <div className="laptop-base"></div>
+          </div>
+          <div className="laptop laptop-right">
+            <div className="laptop-screen">
+              <div className="avatar avatar-teal">●</div>
+              <strong>Peer</strong>
+            </div>
+            <div className="laptop-base"></div>
+          </div>
+        </div>
+      </section>
+
+      <section className="feature-grid">
+        <article className="panel feature-card feature-yellow">
+          <div className="feature-icon">ϟ</div>
+          <div>
+            <h2>Direct Transfer</h2>
+            <span className="feature-rule"></span>
+            <p className="hero-copy feature-copy">
+              Files move from one browser to another without uploading them into a separate storage workflow.
+            </p>
+          </div>
+        </article>
+        <article className="panel feature-card feature-teal">
+          <div className="feature-icon">☊</div>
+          <div>
+            <h2>Simple Session Flow</h2>
+            <span className="feature-rule"></span>
+            <p className="hero-copy feature-copy">
+              Create a room, share the room code, and start sending files as soon as the second participant joins.
+            </p>
+          </div>
+        </article>
+        <article className="panel feature-card feature-purple">
+          <div className="feature-icon">▥</div>
+          <div>
+            <h2>Live Progress</h2>
+            <span className="feature-rule"></span>
+            <p className="hero-copy feature-copy">
+              Track session status, transfer progress, and completed downloads in a single workspace.
+            </p>
+          </div>
+        </article>
+      </section>
+    </>
+  );
+
+  const sharePage = (
+    <>
       <section className="hero-card">
-        <p className="eyebrow">PeerPair / Phase 2</p>
-        <h1>Realtime Peer Signaling Playground</h1>
+        <p className="eyebrow">PeerPair</p>
+        <h1>Secure File Sharing Workspace</h1>
         <p className="hero-copy">
-          Create a room, join with a second browser, and watch signaling + DataChannel state update live.
+          Start a room, invite the other participant with the room code, and send files once the connection is ready.
         </p>
+        <div className="room-actions hero-actions">
+          <button className="btn" onClick={() => setCurrentPage('home')}>Home</button>
+        </div>
       </section>
 
       <section className="panel room-panel">
-        <h2>Room Control</h2>
+        <h2>Room Access</h2>
         <div className="room-actions">
           <button className="btn primary" onClick={handleCreateRoom}>Create Room</button>
           <button className="btn" onClick={handleJoinRoom}>Join Room</button>
@@ -813,52 +868,32 @@ export function App() {
           onChange={(event) => setRoomId(event.target.value)}
         />
         <div className="badge-row">
-          <span className="badge">Active: {joinedRoomId ?? 'None'}</span>
-          <span className="badge">Peers: {peers.length}</span>
+          <span className="badge">Active Room: {joinedRoomId ?? 'None'}</span>
+          <span className="badge">Participants: {peers.length}</span>
         </div>
       </section>
 
       <section className="panel grid-panel">
         <div className="status-tile">
-          <p className="label">Socket</p>
+          <p className="label">Service Link</p>
           <p className={`value ${isConnected ? 'ok' : 'bad'}`}>{isConnected ? 'Connected' : 'Disconnected'}</p>
         </div>
         <div className="status-tile">
-          <p className="label">WebRTC</p>
+          <p className="label">Connection State</p>
           <p className="value">{rtcState}</p>
         </div>
         <div className="status-tile">
-          <p className="label">DataChannel</p>
+          <p className="label">Transfer Channel</p>
           <p className="value">{channelState}</p>
         </div>
         <div className="status-tile">
-          <p className="label">Room Status</p>
+          <p className="label">Session Status</p>
           <p className="value">{statusMessage}</p>
         </div>
       </section>
 
-      <section className="panel chat-panel">
-        <h2>DataChannel Chat</h2>
-        <div className="chat-row">
-          <input
-            className="field"
-            type="text"
-            placeholder="Send message over DataChannel"
-            value={chatMessage}
-            onChange={(event) => setChatMessage(event.target.value)}
-          />
-          <button className="btn primary" onClick={handleSendMessage}>Send</button>
-        </div>
-        <div className="log-box">
-          {chatLog.length === 0 ? <p className="log-empty">No messages yet</p> : null}
-          {chatLog.map((entry, index) => (
-            <p className="log-line" key={`${entry}-${index}`}>{entry}</p>
-          ))}
-        </div>
-      </section>
-
       <section className="panel transfer-panel">
-        <h2>Chunked File Transfer (Phase 5)</h2>
+        <h2>Send Files</h2>
         <div className="transfer-row">
           <input
             className="field"
@@ -869,7 +904,6 @@ export function App() {
           />
           <button className="btn primary" onClick={() => void handleSendFile()}>Send File</button>
         </div>
-        <p className="transfer-note">Chunk size: {Math.round(CHUNK_SIZE_BYTES / 1024)} KB</p>
         <p className="transfer-note">Transfer status: {transferStatus}</p>
         {transferMetrics ? (
           <p className="transfer-note">
@@ -882,28 +916,48 @@ export function App() {
         ) : null}
         {selectedFile ? (
           <p className="transfer-note">
-            Selected: {selectedFile.name} ({Math.ceil(selectedFile.size / 1024)} KB)
+            Selected: {selectedFile.name} ({formatBytes(selectedFile.size)})
           </p>
         ) : null}
         {incomingFile ? (
           <div className="incoming-card">
-            <p>Incoming: {incomingFile.fileName}</p>
+            <p>Incoming file: {incomingFile.fileName}</p>
             <p>
-              Received: {incomingFile.receivedBytes} / {incomingFile.fileSize} bytes
+              Received: {formatBytes(incomingFile.receivedBytes)} / {formatBytes(incomingFile.fileSize)}
             </p>
             {incomingFile.downloadUrl ? (
               <a className="btn" href={incomingFile.downloadUrl} download={incomingFile.fileName}>
-                Download Received File
+                Download File
               </a>
             ) : null}
           </div>
         ) : null}
       </section>
 
-      <footer className="meta">
-        <span>Socket ID: {socketId ?? 'N/A'}</span>
-        <span>Handshake: {pongMessage}</span>
-      </footer>
+      <section className="panel chat-panel">
+        <h2>Session Activity</h2>
+        <div className="log-box">
+          {chatLog.length === 0 ? <p className="log-empty">No session activity yet</p> : null}
+          {chatLog.map((entry, index) => (
+            <p className="log-line" key={`${entry}-${index}`}>{entry}</p>
+          ))}
+        </div>
+      </section>
+    </>
+  );
+
+  return (
+    <main className="app-shell">
+      <aside className="toast-stack" aria-live="polite">
+        {toasts.map((toast) => (
+          <div className="toast toast-error" key={toast.id}>
+            <span>{toast.message}</span>
+            <button className="toast-close" onClick={() => removeToast(toast.id)}>x</button>
+          </div>
+        ))}
+      </aside>
+
+      {currentPage === 'home' ? homePage : sharePage}
     </main>
   );
 }

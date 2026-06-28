@@ -1,4 +1,4 @@
-import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
+import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
 import { useEffect, useRef, useState } from 'react';
 import { socketClient } from './lib/socket/socketClient';
 import { socketEvents } from './lib/socket/socketEvents';
@@ -13,16 +13,14 @@ const MAX_CONNECTION_RETRIES = 4;
 const RETRY_BASE_DELAY_MS = 1200;
 const DATA_CHANNEL_OPEN_TIMEOUT_MS = 12000;
 export function App() {
-    const [socketId, setSocketId] = useState(socketClient.id ?? null);
+    const [currentPage, setCurrentPage] = useState('home');
     const [isConnected, setIsConnected] = useState(socketClient.connected);
-    const [pongMessage, setPongMessage] = useState('waiting');
     const [roomId, setRoomId] = useState('');
     const [joinedRoomId, setJoinedRoomId] = useState(null);
     const [peers, setPeers] = useState([]);
     const [statusMessage, setStatusMessage] = useState('Idle');
     const [rtcState, setRtcState] = useState('new');
     const [channelState, setChannelState] = useState('closed');
-    const [chatMessage, setChatMessage] = useState('');
     const [chatLog, setChatLog] = useState([]);
     const [toasts, setToasts] = useState([]);
     const [selectedFile, setSelectedFile] = useState(null);
@@ -103,6 +101,18 @@ export function App() {
         }
         const bits = totalBytes * 8;
         return bits / (durationMs / 1000) / 1_000_000;
+    }
+    function formatBytes(totalBytes) {
+        if (totalBytes >= 1024 * 1024 * 1024) {
+            return `${(totalBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+        }
+        if (totalBytes >= 1024 * 1024) {
+            return `${(totalBytes / (1024 * 1024)).toFixed(2)} MB`;
+        }
+        if (totalBytes >= 1024) {
+            return `${Math.ceil(totalBytes / 1024)} KB`;
+        }
+        return `${totalBytes} bytes`;
     }
     function waitForBufferToDrain(channel) {
         if (channel.readyState !== 'open') {
@@ -523,25 +533,6 @@ export function App() {
             cleanupPeerConnection();
         });
     }
-    function handleSendMessage() {
-        const message = chatMessage.trim();
-        if (!message) {
-            return;
-        }
-        const channel = dataChannelRef.current;
-        if (!channel || channel.readyState !== 'open') {
-            setStatusMessage('DataChannel is not open yet');
-            pushErrorToast('DataChannel is not open yet');
-            return;
-        }
-        const textMessage = {
-            type: 'text',
-            payload: { message },
-        };
-        channel.send(JSON.stringify(textMessage));
-        addChatLog(`[me] ${message}`);
-        setChatMessage('');
-    }
     async function handleSendFile() {
         if (!selectedFile) {
             pushErrorToast('Pick a file before sending');
@@ -617,30 +608,22 @@ export function App() {
     useEffect(() => {
         function onConnect() {
             setIsConnected(true);
-            setSocketId(socketClient.id ?? null);
-            socketClient.emit(socketEvents.ping, 'hello-phase-0', (response) => {
-                setPongMessage(response.message);
-            });
         }
         function onDisconnect() {
             setIsConnected(false);
-            setSocketId(null);
-        }
-        function onPong(message) {
-            setPongMessage(message);
         }
         socketClient.on('connect', onConnect);
         socketClient.on('disconnect', onDisconnect);
-        socketClient.on(socketEvents.pong, onPong);
         return () => {
             socketClient.off('connect', onConnect);
             socketClient.off('disconnect', onDisconnect);
-            socketClient.off(socketEvents.pong, onPong);
         };
     }, []);
-    return (_jsxs("main", { className: "app-shell", children: [_jsx("aside", { className: "toast-stack", "aria-live": "polite", children: toasts.map((toast) => (_jsxs("div", { className: "toast toast-error", children: [_jsx("span", { children: toast.message }), _jsx("button", { className: "toast-close", onClick: () => removeToast(toast.id), children: "x" })] }, toast.id))) }), _jsxs("section", { className: "hero-card", children: [_jsx("p", { className: "eyebrow", children: "PeerPair / Phase 2" }), _jsx("h1", { children: "Realtime Peer Signaling Playground" }), _jsx("p", { className: "hero-copy", children: "Create a room, join with a second browser, and watch signaling + DataChannel state update live." })] }), _jsxs("section", { className: "panel room-panel", children: [_jsx("h2", { children: "Room Control" }), _jsxs("div", { className: "room-actions", children: [_jsx("button", { className: "btn primary", onClick: handleCreateRoom, children: "Create Room" }), _jsx("button", { className: "btn", onClick: handleJoinRoom, children: "Join Room" }), _jsx("button", { className: "btn danger", onClick: handleLeaveRoom, children: "Leave Room" })] }), _jsx("input", { className: "field", type: "text", placeholder: "Enter room ID", value: roomId, onChange: (event) => setRoomId(event.target.value) }), _jsxs("div", { className: "badge-row", children: [_jsxs("span", { className: "badge", children: ["Active: ", joinedRoomId ?? 'None'] }), _jsxs("span", { className: "badge", children: ["Peers: ", peers.length] })] })] }), _jsxs("section", { className: "panel grid-panel", children: [_jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "Socket" }), _jsx("p", { className: `value ${isConnected ? 'ok' : 'bad'}`, children: isConnected ? 'Connected' : 'Disconnected' })] }), _jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "WebRTC" }), _jsx("p", { className: "value", children: rtcState })] }), _jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "DataChannel" }), _jsx("p", { className: "value", children: channelState })] }), _jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "Room Status" }), _jsx("p", { className: "value", children: statusMessage })] })] }), _jsxs("section", { className: "panel chat-panel", children: [_jsx("h2", { children: "DataChannel Chat" }), _jsxs("div", { className: "chat-row", children: [_jsx("input", { className: "field", type: "text", placeholder: "Send message over DataChannel", value: chatMessage, onChange: (event) => setChatMessage(event.target.value) }), _jsx("button", { className: "btn primary", onClick: handleSendMessage, children: "Send" })] }), _jsxs("div", { className: "log-box", children: [chatLog.length === 0 ? _jsx("p", { className: "log-empty", children: "No messages yet" }) : null, chatLog.map((entry, index) => (_jsx("p", { className: "log-line", children: entry }, `${entry}-${index}`)))] })] }), _jsxs("section", { className: "panel transfer-panel", children: [_jsx("h2", { children: "Chunked File Transfer (Phase 5)" }), _jsxs("div", { className: "transfer-row", children: [_jsx("input", { className: "field", type: "file", onChange: (event) => {
+    const homePage = (_jsxs(_Fragment, { children: [_jsxs("section", { className: "hero-card home-hero", children: [_jsxs("div", { className: "hero-content", children: [_jsxs("p", { className: "eyebrow", children: [_jsx("span", { className: "brand-mark", children: "PP" }), " PeerPair"] }), _jsxs("h1", { children: ["Private file sharing, ", _jsx("span", { children: "directly" }), " between browsers"] }), _jsx("p", { className: "hero-copy", children: "PeerPair lets two people connect in a shared room and transfer files directly, with a simple workflow built for fast, secure handoffs." }), _jsx("div", { className: "room-actions hero-actions", children: _jsxs("button", { className: "btn primary hero-cta", onClick: () => setCurrentPage('share'), children: [_jsx("span", { "aria-hidden": "true", children: "\u21A5" }), " Share Files"] }) })] }), _jsxs("div", { className: "hero-visual", "aria-hidden": "true", children: [_jsx("div", { className: "orbit orbit-left" }), _jsx("div", { className: "orbit orbit-right" }), _jsx("div", { className: "spark spark-one", children: "\u2726" }), _jsx("div", { className: "spark spark-two", children: "\u25C6" }), _jsx("div", { className: "spark spark-three", children: "\u2726" }), _jsxs("div", { className: "file-card", children: [_jsx("span", {}), _jsx("span", {}), _jsx("span", {})] }), _jsx("div", { className: "transfer-arc" }), _jsx("div", { className: "check-bubble", children: "\u2713" }), _jsxs("div", { className: "laptop laptop-left", children: [_jsxs("div", { className: "laptop-screen", children: [_jsx("div", { className: "avatar avatar-yellow", children: "\u25CF" }), _jsx("strong", { children: "You" })] }), _jsx("div", { className: "laptop-base" })] }), _jsxs("div", { className: "laptop laptop-right", children: [_jsxs("div", { className: "laptop-screen", children: [_jsx("div", { className: "avatar avatar-teal", children: "\u25CF" }), _jsx("strong", { children: "Peer" })] }), _jsx("div", { className: "laptop-base" })] })] })] }), _jsxs("section", { className: "feature-grid", children: [_jsxs("article", { className: "panel feature-card feature-yellow", children: [_jsx("div", { className: "feature-icon", children: "\u03DF" }), _jsxs("div", { children: [_jsx("h2", { children: "Direct Transfer" }), _jsx("span", { className: "feature-rule" }), _jsx("p", { className: "hero-copy feature-copy", children: "Files move from one browser to another without uploading them into a separate storage workflow." })] })] }), _jsxs("article", { className: "panel feature-card feature-teal", children: [_jsx("div", { className: "feature-icon", children: "\u260A" }), _jsxs("div", { children: [_jsx("h2", { children: "Simple Session Flow" }), _jsx("span", { className: "feature-rule" }), _jsx("p", { className: "hero-copy feature-copy", children: "Create a room, share the room code, and start sending files as soon as the second participant joins." })] })] }), _jsxs("article", { className: "panel feature-card feature-purple", children: [_jsx("div", { className: "feature-icon", children: "\u25A5" }), _jsxs("div", { children: [_jsx("h2", { children: "Live Progress" }), _jsx("span", { className: "feature-rule" }), _jsx("p", { className: "hero-copy feature-copy", children: "Track session status, transfer progress, and completed downloads in a single workspace." })] })] })] })] }));
+    const sharePage = (_jsxs(_Fragment, { children: [_jsxs("section", { className: "hero-card", children: [_jsx("p", { className: "eyebrow", children: "PeerPair" }), _jsx("h1", { children: "Secure File Sharing Workspace" }), _jsx("p", { className: "hero-copy", children: "Start a room, invite the other participant with the room code, and send files once the connection is ready." }), _jsx("div", { className: "room-actions hero-actions", children: _jsx("button", { className: "btn", onClick: () => setCurrentPage('home'), children: "Home" }) })] }), _jsxs("section", { className: "panel room-panel", children: [_jsx("h2", { children: "Room Access" }), _jsxs("div", { className: "room-actions", children: [_jsx("button", { className: "btn primary", onClick: handleCreateRoom, children: "Create Room" }), _jsx("button", { className: "btn", onClick: handleJoinRoom, children: "Join Room" }), _jsx("button", { className: "btn danger", onClick: handleLeaveRoom, children: "Leave Room" })] }), _jsx("input", { className: "field", type: "text", placeholder: "Enter room ID", value: roomId, onChange: (event) => setRoomId(event.target.value) }), _jsxs("div", { className: "badge-row", children: [_jsxs("span", { className: "badge", children: ["Active Room: ", joinedRoomId ?? 'None'] }), _jsxs("span", { className: "badge", children: ["Participants: ", peers.length] })] })] }), _jsxs("section", { className: "panel grid-panel", children: [_jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "Service Link" }), _jsx("p", { className: `value ${isConnected ? 'ok' : 'bad'}`, children: isConnected ? 'Connected' : 'Disconnected' })] }), _jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "Connection State" }), _jsx("p", { className: "value", children: rtcState })] }), _jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "Transfer Channel" }), _jsx("p", { className: "value", children: channelState })] }), _jsxs("div", { className: "status-tile", children: [_jsx("p", { className: "label", children: "Session Status" }), _jsx("p", { className: "value", children: statusMessage })] })] }), _jsxs("section", { className: "panel transfer-panel", children: [_jsx("h2", { children: "Send Files" }), _jsxs("div", { className: "transfer-row", children: [_jsx("input", { className: "field", type: "file", onChange: (event) => {
                                     setSelectedFile(event.target.files?.[0] ?? null);
-                                } }), _jsx("button", { className: "btn primary", onClick: () => void handleSendFile(), children: "Send File" })] }), _jsxs("p", { className: "transfer-note", children: ["Chunk size: ", Math.round(CHUNK_SIZE_BYTES / 1024), " KB"] }), _jsxs("p", { className: "transfer-note", children: ["Transfer status: ", transferStatus] }), transferMetrics ? (_jsxs("p", { className: "transfer-note", children: ["Last ", transferMetrics.direction, ": ", transferMetrics.fileName, " at ", transferMetrics.speedMbps.toFixed(2), " Mbps in", ' ', (transferMetrics.durationMs / 1000).toFixed(2), "s", typeof transferMetrics.peakBufferedAmount === 'number'
+                                } }), _jsx("button", { className: "btn primary", onClick: () => void handleSendFile(), children: "Send File" })] }), _jsxs("p", { className: "transfer-note", children: ["Transfer status: ", transferStatus] }), transferMetrics ? (_jsxs("p", { className: "transfer-note", children: ["Last ", transferMetrics.direction, ": ", transferMetrics.fileName, " at ", transferMetrics.speedMbps.toFixed(2), " Mbps in", ' ', (transferMetrics.durationMs / 1000).toFixed(2), "s", typeof transferMetrics.peakBufferedAmount === 'number'
                                 ? ` (peak buffer ${Math.round(transferMetrics.peakBufferedAmount / 1024)} KB)`
-                                : ''] })) : null, selectedFile ? (_jsxs("p", { className: "transfer-note", children: ["Selected: ", selectedFile.name, " (", Math.ceil(selectedFile.size / 1024), " KB)"] })) : null, incomingFile ? (_jsxs("div", { className: "incoming-card", children: [_jsxs("p", { children: ["Incoming: ", incomingFile.fileName] }), _jsxs("p", { children: ["Received: ", incomingFile.receivedBytes, " / ", incomingFile.fileSize, " bytes"] }), incomingFile.downloadUrl ? (_jsx("a", { className: "btn", href: incomingFile.downloadUrl, download: incomingFile.fileName, children: "Download Received File" })) : null] })) : null] }), _jsxs("footer", { className: "meta", children: [_jsxs("span", { children: ["Socket ID: ", socketId ?? 'N/A'] }), _jsxs("span", { children: ["Handshake: ", pongMessage] })] })] }));
+                                : ''] })) : null, selectedFile ? (_jsxs("p", { className: "transfer-note", children: ["Selected: ", selectedFile.name, " (", formatBytes(selectedFile.size), ")"] })) : null, incomingFile ? (_jsxs("div", { className: "incoming-card", children: [_jsxs("p", { children: ["Incoming file: ", incomingFile.fileName] }), _jsxs("p", { children: ["Received: ", formatBytes(incomingFile.receivedBytes), " / ", formatBytes(incomingFile.fileSize)] }), incomingFile.downloadUrl ? (_jsx("a", { className: "btn", href: incomingFile.downloadUrl, download: incomingFile.fileName, children: "Download File" })) : null] })) : null] }), _jsxs("section", { className: "panel chat-panel", children: [_jsx("h2", { children: "Session Activity" }), _jsxs("div", { className: "log-box", children: [chatLog.length === 0 ? _jsx("p", { className: "log-empty", children: "No session activity yet" }) : null, chatLog.map((entry, index) => (_jsx("p", { className: "log-line", children: entry }, `${entry}-${index}`)))] })] })] }));
+    return (_jsxs("main", { className: "app-shell", children: [_jsx("aside", { className: "toast-stack", "aria-live": "polite", children: toasts.map((toast) => (_jsxs("div", { className: "toast toast-error", children: [_jsx("span", { children: toast.message }), _jsx("button", { className: "toast-close", onClick: () => removeToast(toast.id), children: "x" })] }, toast.id))) }), currentPage === 'home' ? homePage : sharePage] }));
 }
